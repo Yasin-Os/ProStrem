@@ -1,0 +1,57 @@
+name: Build ProStream APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Android APK
+        uses: tyron12233/CodeAssist@main
+        with:
+          variant: debug
+          artifact-name: ProStream-debug
+
+      - name: Download APK artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: ProStream-debug
+          path: ./apk
+
+      - name: Prepare APK
+        shell: bash
+        run: |
+          APK=$(find ./apk -type f -name "*.apk" | head -n 1)
+
+          if [ -z "$APK" ]; then
+            echo "APK not found!"
+            find ./apk -type f
+            exit 1
+          fi
+
+          cp "$APK" ./ProStream.apk
+
+          echo "APK ready:"
+          ls -lh ./ProStream.apk
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="build-${{ github.run_number }}"
+
+          gh release create "$TAG" \
+            ./ProStream.apk#ProStream.apk \
+            --title "ProStream Build ${{ github.run_number }}" \
+            --notes "Automatic ProStream APK build."
