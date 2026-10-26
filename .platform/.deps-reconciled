@@ -1,0 +1,9 @@
+v=5
+g=2
+repos=https://repo1.maven.org/maven2,https://dl.google.com/android/maven2
+app|androidx.appcompat:appcompat:1.7.0|
+app|androidx.biometric:biometric:1.1.0|
+app|androidx.constraintlayout:constraintlayout:2.2.0|
+app|androidx.databinding:viewbinding:8.7.3|
+app|androidx.swiperefreshlayout:swiperefreshlayout:1.1.0|
+app|com.google.android.material:material:1.12.0|
