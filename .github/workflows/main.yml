@@ -17,6 +17,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Inject Release Build Info into strings.xml
+        shell: bash
+        run: |
+          cat << 'XML_EOF' > app/src/main/res/values/strings.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">ProStream</string>
+              <string name="github_repo">${{ github.repository }}</string>
+              <string name="build_number">${{ github.run_number }}</string>
+              <string name="app_version">2.0.${{ github.run_number }}</string>
+          </resources>
+          XML_EOF
+          sed -i "s|\${{ github.repository }}|${{ github.repository }}|g" app/src/main/res/values/strings.xml
+          sed -i "s|\${{ github.run_number }}|${{ github.run_number }}|g" app/src/main/res/values/strings.xml
+          cat app/src/main/res/values/strings.xml
+
       - name: Build Android APK
         uses: tyron12233/CodeAssist@main
         with:
@@ -51,7 +67,4 @@ jobs:
         run: |
           TAG="build-${{ github.run_number }}"
 
-          gh release create "$TAG" \
-            ./ProStream.apk#ProStream.apk \
-            --title "ProStream Build ${{ github.run_number }}" \
-            --notes "Automatic ProStream APK build."
+          gh release create "$TAG"             ./ProStream.apk#ProStream.apk             --title "ProStream Build ${{ github.run_number }}"             --notes "Automatic ProStream APK build (#${{ github.run_number }}) with In-App Updater."             --latest
