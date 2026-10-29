@@ -18,6 +18,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
+import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.graphics.Bitmap;
@@ -42,7 +43,6 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.Message;
 import android.os.PowerManager;
 import android.provider.MediaStore;
 import android.provider.Settings;
@@ -65,12 +65,16 @@ import android.webkit.GeolocationPermissions;
 import android.webkit.JsPromptResult;
 import android.webkit.JsResult;
 import android.webkit.PermissionRequest;
+import android.webkit.RenderProcessGoneDetail;
 import android.webkit.SslErrorHandler;
 import android.webkit.URLUtil;
 import android.webkit.ValueCallback;
+import android.webkit.WebBackForwardList;
 import android.webkit.WebChromeClient;
+import android.webkit.WebHistoryItem;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -79,6 +83,7 @@ import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.MediaController;
 import android.widget.ProgressBar;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
@@ -86,6 +91,7 @@ import android.widget.ScrollView;
 import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.widget.VideoView;
 
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
@@ -103,6 +109,7 @@ import org.json.JSONObject;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -111,9 +118,11 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.RandomAccessFile;
+import java.lang.reflect.Method;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -133,6 +142,10 @@ import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+
+import javax.crypto.Cipher;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
 
 public class HomeActivity extends AppCompatActivity {
 
@@ -154,7 +167,6 @@ public class HomeActivity extends AppCompatActivity {
     private static final ExecutorService customDlExecutor = Executors.newFixedThreadPool(4);
     private static final ExecutorService parallelChunkPool = Executors.newFixedThreadPool(8);
 
-    // বর্তমান পেজে প্লে হওয়া ভিডিওগুলোর রিয়েল-টাইম ক্যাশ (০% CPU ওভারহেডে তাৎক্ষণিক ডাউনলোডের জন্য)
     private static final LinkedHashMap<String, String> liveDetectedStreamsMap = new LinkedHashMap<String, String>() {
         @Override
         protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
@@ -168,9 +180,51 @@ public class HomeActivity extends AppCompatActivity {
     private static boolean isNotificationTrackerRunning = false;
     private static boolean isReceiverRegisteredOnApp = false;
     private static boolean sessionAlive = false;
+    private static boolean sessionUnlocked = false;
 
     public static boolean isSessionAlive() {
         return sessionAlive;
+    }
+
+    public static boolean isSessionUnlocked() {
+        return sessionUnlocked;
+    }
+
+    public static void setSessionUnlocked(boolean unlocked) {
+        sessionUnlocked = unlocked;
+    }
+
+    public static void forceEnableAnimations() {
+        try {
+            Method setDurationScale = ValueAnimator.class.getDeclaredMethod("setDurationScale", float.class);
+            setDurationScale.setAccessible(true);
+            setDurationScale.invoke(null, 1.0f);
+        } catch (Throwable ignored) {}
+    }
+
+    private static final String[] BLOCKED_AD_DOMAINS = {
+            "doubleclick.net", "googlesyndication.com", "googleadservices.com",
+            "popads.net", "popcash.net", "onclickalgo.com", "onclickperformance.com",
+            "adsterra.com", "exoclick.com", "realsrv.com", "tsyndicate.com",
+            "juicyads.com", "propellerads.com", "hilltopads.net", "clickadu.com",
+            "trafficjunky.net", "acscdn.com", "histats.com", "magsrv.com",
+            "twinrds.com", "bidgear.com", "galaksion.com", "yllix.com",
+            "adcash.com", "evadav.com", "push.house", "richads.com",
+            "bet365.com", "1xbet.com", "melbet.com", "mostbet.com"
+    };
+
+    private static boolean isBlockedAdUrl(String url) {
+        if (url == null || url.isEmpty()) return false;
+        String lower = url.toLowerCase(Locale.ROOT);
+        if (lower.contains("cloudflare") || lower.contains("turnstile") || lower.contains("cdn-cgi")) {
+            return false;
+        }
+        for (String domain : BLOCKED_AD_DOMAINS) {
+            if (lower.contains(domain)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private View rootLayout;
@@ -194,18 +248,25 @@ public class HomeActivity extends AppCompatActivity {
 
     private final Map<String, WebView> webViewPool = new HashMap<>();
     private final Map<WebView, String> lastFailedUrlMap = new HashMap<>();
+    private final Set<WebView> clearHistoryOnLoadSet = Collections.synchronizedSet(new HashSet<>());
+    private final Set<String> fetchingOgUrls = Collections.synchronizedSet(new HashSet<>());
 
     private SiteItem currentSite;
     private final int appColor = Color.parseColor("#00A884");
     private boolean darkModeEnabled = false;
     private boolean batterySaverEnabled = true;
+    private boolean launchingInternalActivity = false;
+    private boolean leftAppToBackground = false;
+    private File pendingUpdateApkFile = null;
+    private static boolean hasAutoCheckedUpdateThisSession = false;
     private Typeface modernFont;
     private String browserUserAgent;
 
-    private final ExecutorService bgExecutor = Executors.newFixedThreadPool(3);
+    private static final ExecutorService bgExecutor = Executors.newFixedThreadPool(4);
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private Runnable mediaLiveRefreshRunnable;
     private final ArrayList<ValueAnimator> activePopupAnimators = new ArrayList<>();
+    private final ArrayList<ValueAnimator> hubIdleAnimators = new ArrayList<>();
     private LruCache<String, Bitmap> ogMemoryCache;
 
     static class CustomDownloadTask {
@@ -358,6 +419,7 @@ public class HomeActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        forceEnableAnimations();
         sessionAlive = true;
         appContextRef = getApplicationContext();
         WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
@@ -371,8 +433,8 @@ public class HomeActivity extends AppCompatActivity {
         ivHubIcon = findViewById(R.id.ivHubIcon);
         tvHubBadge = findViewById(R.id.tvHubBadge);
 
-        ogMemoryCache = new LruCache<>(28);
-        browserUserAgent = WebSettings.getDefaultUserAgent(this).replace("; wv", "");
+        ogMemoryCache = new LruCache<>(36);
+        browserUserAgent = buildAuthenticBrowserUserAgent(this);
 
         if (rootLayout != null) {
             ViewCompat.setOnApplyWindowInsetsListener(rootLayout, (v, insets) -> {
@@ -395,7 +457,19 @@ public class HomeActivity extends AppCompatActivity {
 
         CookieManager cookieManager = CookieManager.getInstance();
         cookieManager.setAcceptCookie(true);
-        restoreCookiesFromVault();
+        if (!sharedPrefs.getBoolean("CF_NATIVE_COOKIE_CLEAN_V6", false)) {
+            sharedPrefs.edit()
+                    .remove("COOKIE_VAULT_V4")
+                    .putBoolean("CF_NATIVE_COOKIE_CLEAN_V6", true)
+                    .apply();
+            try {
+                cookieManager.removeAllCookies(value -> {
+                    try {
+                        CookieManager.getInstance().flush();
+                    } catch (Exception ignored) {}
+                });
+            } catch (Exception ignored) {}
+        }
 
         setupNotificationChannelsStatic(appContextRef);
         registerGlobalReceiverIfNeeded(appContextRef);
@@ -424,59 +498,31 @@ public class HomeActivity extends AppCompatActivity {
         loadCustomLinksAndPreloadAll();
         applyDynamicTheme();
         setupDraggableFloatingHub();
+        startFloatingHubBreathingAnimation();
         startNotificationProgressTrackerStatic(appContextRef);
 
         if (getIntent() != null && getIntent().getBooleanExtra("OPEN_MEDIA_DIALOG", false)) {
             mainHandler.postDelayed(this::showMediaDownloadsDialog, 350);
         }
+
+        if (!hasAutoCheckedUpdateThisSession) {
+            hasAutoCheckedUpdateThisSession = true;
+            mainHandler.postDelayed(() -> checkForAppUpdateInBackground(false), 3500);
+        }
     }
 
-    private void saveCookiesToVault(String url) {
+    private static String buildAuthenticBrowserUserAgent(Context ctx) {
         try {
-            CookieManager cm = CookieManager.getInstance();
-            cm.flush();
-            if (url == null || !url.startsWith("http")) return;
-
-            Uri uri = Uri.parse(url);
-            String host = uri.getHost();
-            if (host == null || host.isEmpty()) return;
-            String baseOrigin = uri.getScheme() + "://" + host;
-
-            String rawCookies = cm.getCookie(url);
-            if (rawCookies == null || rawCookies.isEmpty()) {
-                rawCookies = cm.getCookie(baseOrigin);
+            String raw = WebSettings.getDefaultUserAgent(ctx);
+            if (raw != null && !raw.isEmpty()) {
+                return raw
+                        .replace("; wv)", ")")
+                        .replace("; wv;", ";")
+                        .replace("; wv", "")
+                        .replaceAll("Version/\\d+\\.\\d+\\s*", "");
             }
-            if (rawCookies == null || rawCookies.isEmpty()) return;
-
-            String vaultStr = sharedPrefs.getString("COOKIE_VAULT_V4", "{}");
-            JSONObject vault = new JSONObject(vaultStr);
-            vault.put(baseOrigin, rawCookies);
-            sharedPrefs.edit().putString("COOKIE_VAULT_V4", vault.toString()).apply();
         } catch (Exception ignored) {}
-    }
-
-    private void restoreCookiesFromVault() {
-        try {
-            CookieManager cm = CookieManager.getInstance();
-            cm.setAcceptCookie(true);
-            String vaultStr = sharedPrefs.getString("COOKIE_VAULT_V4", "{}");
-            JSONObject vault = new JSONObject(vaultStr);
-            Iterator<String> keys = vault.keys();
-            while (keys.hasNext()) {
-                String origin = keys.next();
-                String cookieLine = vault.optString(origin, "");
-                if (!cookieLine.isEmpty()) {
-                    String[] pairs = cookieLine.split(";");
-                    for (String pair : pairs) {
-                        String trimmed = pair.trim();
-                        if (!trimmed.isEmpty()) {
-                            cm.setCookie(origin, trimmed + "; Path=/");
-                        }
-                    }
-                }
-            }
-            cm.flush();
-        } catch (Exception ignored) {}
+        return "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36";
     }
 
     private static void registerGlobalReceiverIfNeeded(Context appCtx) {
@@ -528,6 +574,7 @@ public class HomeActivity extends AppCompatActivity {
 
             if (!needed.isEmpty()) {
                 try {
+                    launchingInternalActivity = true;
                     requestPermissions(needed.toArray(new String[0]), 701);
                 } catch (Exception ignored) {}
             } else if (requestedByUser) {
@@ -538,6 +585,7 @@ public class HomeActivity extends AppCompatActivity {
                 try {
                     PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
                     if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
+                        launchingInternalActivity = true;
                         Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
                         intent.setData(Uri.parse("package:" + getPackageName()));
                         startActivity(intent);
@@ -920,12 +968,33 @@ public class HomeActivity extends AppCompatActivity {
 
         final WebView target = webView;
         target.stopLoading();
-        target.goBack();
 
-        target.setTranslationX(-dpToPx(16));
+        int stepsBack = -1;
+        try {
+            WebBackForwardList history = target.copyBackForwardList();
+            if (history != null) {
+                int curIdx = history.getCurrentIndex();
+                if (curIdx - 1 >= 0) {
+                    WebHistoryItem prevItem = history.getItemAtIndex(curIdx - 1);
+                    if (prevItem != null && "about:blank".equalsIgnoreCase(prevItem.getUrl()) && curIdx - 2 >= 0) {
+                        stepsBack = -2;
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+
+        if (stepsBack < -1 && target.canGoBackOrForward(stepsBack)) {
+            target.goBackOrForward(stepsBack);
+        } else {
+            target.goBack();
+        }
+
+        target.setAlpha(0.55f);
+        target.setTranslationX(-dpToPx(24));
         target.animate()
+                .alpha(1f)
                 .translationX(0f)
-                .setDuration(140)
+                .setDuration(180)
                 .setInterpolator(new DecelerateInterpolator())
                 .start();
     }
@@ -1049,6 +1118,7 @@ public class HomeActivity extends AppCompatActivity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         retryParams.setMargins(0, 0, 0, dpToPx(8));
         btnRetry.setLayoutParams(retryParams);
+        attachTouchBounceAnimation(btnRetry);
         btnRetry.setOnClickListener(v -> {
             if (swipeRefresh != null) swipeRefresh.setRefreshing(true);
             reloadActivePageCleanly();
@@ -1058,6 +1128,7 @@ public class HomeActivity extends AppCompatActivity {
         TextView btnSwitch = createDialogButton("Switch Site", "#7DD3FC", "#17253B");
         btnSwitch.setLayoutParams(new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        attachTouchBounceAnimation(btnSwitch);
         btnSwitch.setOnClickListener(v -> showInstantAppSwitcherDialog());
         card.addView(btnSwitch);
 
@@ -1075,7 +1146,15 @@ public class HomeActivity extends AppCompatActivity {
         if (modernOfflineOverlay.getVisibility() != View.VISIBLE) {
             modernOfflineOverlay.setVisibility(View.VISIBLE);
             modernOfflineOverlay.setAlpha(0f);
-            modernOfflineOverlay.animate().alpha(1f).setDuration(200).start();
+            modernOfflineOverlay.setScaleX(0.92f);
+            modernOfflineOverlay.setScaleY(0.92f);
+            modernOfflineOverlay.animate()
+                    .alpha(1f)
+                    .scaleX(1f)
+                    .scaleY(1f)
+                    .setDuration(240)
+                    .setInterpolator(new OvershootInterpolator(1.1f))
+                    .start();
         }
     }
 
@@ -1102,9 +1181,13 @@ public class HomeActivity extends AppCompatActivity {
             View child = webViewHolder.getChildAt(i);
             if (child != modernOfflineOverlay) {
                 child.setVisibility(View.GONE);
-                if (child instanceof WebView && batterySaverEnabled) {
+                if (child instanceof WebView) {
                     try {
-                        ((WebView) child).onPause();
+                        WebView bgWv = (WebView) child;
+                        bgWv.evaluateJavascript("(function(){var m=document.querySelectorAll('video,audio');for(var i=0;i<m.length;i++){try{m[i].pause();}catch(e){}}})();", null);
+                        if (batterySaverEnabled) {
+                            bgWv.onPause();
+                        }
                     } catch (Exception ignored) {}
                 }
             }
@@ -1122,10 +1205,16 @@ public class HomeActivity extends AppCompatActivity {
         }
 
         targetWv.setVisibility(View.VISIBLE);
-        targetWv.setTranslationX(dpToPx(12));
+        targetWv.setAlpha(0.55f);
+        targetWv.setTranslationX(dpToPx(22));
+        targetWv.setScaleX(0.97f);
+        targetWv.setScaleY(0.97f);
         targetWv.animate()
+                .alpha(1f)
                 .translationX(0f)
-                .setDuration(150)
+                .scaleX(1f)
+                .scaleY(1f)
+                .setDuration(220)
                 .setInterpolator(new DecelerateInterpolator())
                 .start();
 
@@ -1145,25 +1234,39 @@ public class HomeActivity extends AppCompatActivity {
         }
     }
 
-    private void preloadRemainingSitesInBackground() {
-        if (batterySaverEnabled) {
-            return;
+    private void startFloatingHubBreathingAnimation() {
+        for (ValueAnimator a : hubIdleAnimators) {
+            try { a.cancel(); } catch (Exception ignored) {}
         }
-        for (int i = 0; i < siteList.size(); i++) {
-            final SiteItem item = siteList.get(i);
-            if (webViewPool.containsKey(item.url)) continue;
+        hubIdleAnimators.clear();
+        if (btnFloatingHub == null) return;
 
-            mainHandler.postDelayed(() -> {
-                if (!isFinishing() && !batterySaverEnabled && webViewHolder != null && !webViewPool.containsKey(item.url)) {
-                    WebView bgWv = createConfiguredWebView(item);
-                    bgWv.setVisibility(View.GONE);
-                    webViewPool.put(item.url, bgWv);
-                    webViewHolder.addView(bgWv, 0, new FrameLayout.LayoutParams(
-                            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-                    bgWv.loadUrl(item.getEffectiveUrl());
-                }
-            }, 3000L * (i + 1));
-        }
+        ObjectAnimator hubPulse = ObjectAnimator.ofPropertyValuesHolder(
+                btnFloatingHub,
+                PropertyValuesHolder.ofFloat("scaleX", 1f, 1.06f, 1f),
+                PropertyValuesHolder.ofFloat("scaleY", 1f, 1.06f, 1f)
+        );
+        hubPulse.setDuration(2400);
+        hubPulse.setRepeatCount(ValueAnimator.INFINITE);
+        hubPulse.setInterpolator(new AccelerateDecelerateInterpolator());
+        hubPulse.start();
+        hubIdleAnimators.add(hubPulse);
+
+        ValueAnimator hubStrokeGlow = ValueAnimator.ofArgb(
+                Color.parseColor("#00F5A0"),
+                Color.parseColor("#00E5FF"),
+                Color.parseColor("#7C3AED"),
+                Color.parseColor("#00F5A0")
+        );
+        hubStrokeGlow.setDuration(3600);
+        hubStrokeGlow.setRepeatCount(ValueAnimator.INFINITE);
+        hubStrokeGlow.addUpdateListener(anim -> {
+            if (btnFloatingHub != null) {
+                btnFloatingHub.setStrokeColor((int) anim.getAnimatedValue());
+            }
+        });
+        hubStrokeGlow.start();
+        hubIdleAnimators.add(hubStrokeGlow);
     }
 
     private void setupDraggableFloatingHub() {
@@ -1193,7 +1296,7 @@ public class HomeActivity extends AppCompatActivity {
                         downRawX = event.getRawX();
                         downRawY = event.getRawY();
                         isDragging = false;
-                        v.animate().scaleX(0.86f).scaleY(0.86f).setDuration(90).start();
+                        v.animate().scaleX(0.84f).scaleY(0.84f).setDuration(90).start();
                         return true;
 
                     case MotionEvent.ACTION_MOVE:
@@ -1214,10 +1317,10 @@ public class HomeActivity extends AppCompatActivity {
 
                     case MotionEvent.ACTION_UP:
                     case MotionEvent.ACTION_CANCEL:
-                        v.animate().scaleX(1f).scaleY(1f).setDuration(200).setInterpolator(new OvershootInterpolator(1.6f)).start();
+                        v.animate().scaleX(1f).scaleY(1f).setDuration(220).setInterpolator(new OvershootInterpolator(1.75f)).start();
                         if (!isDragging) {
                             if (ivHubIcon != null) {
-                                ivHubIcon.animate().rotationBy(180f).setDuration(320).start();
+                                ivHubIcon.animate().rotationBy(360f).setDuration(380).setInterpolator(new OvershootInterpolator(1.2f)).start();
                             }
                             showInstantAppSwitcherDialog();
                         } else {
@@ -1242,6 +1345,26 @@ public class HomeActivity extends AppCompatActivity {
         activePopupAnimators.clear();
     }
 
+    private void showAnimatedDialog(final AlertDialog dialog, final View rootCard) {
+        if (dialog == null) return;
+        forceEnableAnimations();
+        if (rootCard != null) {
+            rootCard.setAlpha(0f);
+            rootCard.setScaleX(0.76f);
+            rootCard.setScaleY(0.76f);
+            rootCard.setTranslationY(dpToPx(42));
+            dialog.setOnShowListener(d -> rootCard.animate()
+                    .alpha(1f)
+                    .scaleX(1f)
+                    .scaleY(1f)
+                    .translationY(0f)
+                    .setDuration(320)
+                    .setInterpolator(new OvershootInterpolator(1.25f))
+                    .start());
+        }
+        dialog.show();
+    }
+
     private void dismissPopupWithAnimation(final AlertDialog dialog, final View animTarget, final Runnable afterDismiss) {
         if (dialog == null || !dialog.isShowing()) {
             if (afterDismiss != null) afterDismiss.run();
@@ -1254,10 +1377,10 @@ public class HomeActivity extends AppCompatActivity {
         }
         animTarget.animate()
                 .alpha(0f)
-                .scaleX(0.84f)
-                .scaleY(0.84f)
-                .translationY(dpToPx(28))
-                .setDuration(150)
+                .scaleX(0.82f)
+                .scaleY(0.82f)
+                .translationY(dpToPx(30))
+                .setDuration(160)
                 .setInterpolator(new AccelerateDecelerateInterpolator())
                 .withEndAction(() -> {
                     try {
@@ -1273,11 +1396,11 @@ public class HomeActivity extends AppCompatActivity {
         view.setOnTouchListener((v, event) -> {
             switch (event.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN:
-                    v.animate().scaleX(0.93f).scaleY(0.93f).setDuration(80).start();
+                    v.animate().scaleX(0.92f).scaleY(0.92f).setDuration(80).start();
                     break;
                 case MotionEvent.ACTION_UP:
                 case MotionEvent.ACTION_CANCEL:
-                    v.animate().scaleX(1f).scaleY(1f).setDuration(160).setInterpolator(new OvershootInterpolator(1.5f)).start();
+                    v.animate().scaleX(1f).scaleY(1f).setDuration(180).setInterpolator(new OvershootInterpolator(1.6f)).start();
                     break;
             }
             return false;
@@ -1286,6 +1409,7 @@ public class HomeActivity extends AppCompatActivity {
 
     private void showInstantAppSwitcherDialog() {
         try {
+            forceEnableAnimations();
             stopPopupAnimators();
 
             AlertDialog.Builder builder = new AlertDialog.Builder(this);
@@ -1300,54 +1424,16 @@ public class HomeActivity extends AppCompatActivity {
             final MaterialCardView rootCard = dialogView.findViewById(R.id.dialogRootCard);
             final View animTarget = rootCard != null ? rootCard : dialogView;
             animTarget.setAlpha(0f);
-            animTarget.setScaleX(0.72f);
-            animTarget.setScaleY(0.72f);
-            animTarget.setTranslationY(dpToPx(56));
+            animTarget.setScaleX(0.70f);
+            animTarget.setScaleY(0.70f);
+            animTarget.setTranslationY(dpToPx(60));
 
-            dialog.setOnShowListener(d -> {
-                animTarget.post(() -> {
-                    animTarget.animate()
-                            .alpha(1f)
-                            .scaleX(1f)
-                            .scaleY(1f)
-                            .translationY(0f)
-                            .setDuration(340)
-                            .setInterpolator(new OvershootInterpolator(1.28f))
-                            .start();
-                });
-            });
-
-            dialog.setOnDismissListener(d -> stopPopupAnimators());
+            final List<View> cascadeViews = new ArrayList<>();
 
             View headerRow = dialogView.findViewById(R.id.dialogHeaderRow);
             if (headerRow != null) {
-                animateCascadeItem(headerRow, 20);
-            }
-
-            if (rootCard != null) {
-                ValueAnimator borderGlow = ValueAnimator.ofArgb(
-                        Color.parseColor("#00F5A0"),
-                        Color.parseColor("#00E5FF"),
-                        Color.parseColor("#7C3AED"),
-                        Color.parseColor("#00F5A0"));
-                borderGlow.setDuration(3200);
-                borderGlow.setRepeatCount(ValueAnimator.INFINITE);
-                borderGlow.addUpdateListener(a -> rootCard.setStrokeColor((int) a.getAnimatedValue()));
-                borderGlow.start();
-                activePopupAnimators.add(borderGlow);
-            }
-
-            View cardFlashBadge = dialogView.findViewById(R.id.cardFlashBadge);
-            if (cardFlashBadge != null) {
-                ObjectAnimator logoPulse = ObjectAnimator.ofPropertyValuesHolder(
-                        cardFlashBadge,
-                        PropertyValuesHolder.ofFloat("scaleX", 1f, 1.09f, 1f),
-                        PropertyValuesHolder.ofFloat("scaleY", 1f, 1.09f, 1f)
-                );
-                logoPulse.setDuration(2000);
-                logoPulse.setRepeatCount(ValueAnimator.INFINITE);
-                logoPulse.start();
-                activePopupAnimators.add(logoPulse);
+                prepareCascadeView(headerRow);
+                cascadeViews.add(headerRow);
             }
 
             TextView tvCount = dialogView.findViewById(R.id.tvReadyCount);
@@ -1437,7 +1523,6 @@ public class HomeActivity extends AppCompatActivity {
 
                     final ImageView icon = new ImageView(this);
                     icon.setScaleType(ImageView.ScaleType.CENTER_CROP);
-                    icon.setImageBitmap(createRoundedLetterBitmap(site.name, siteColorInt));
                     icon.setLayoutParams(new LinearLayout.LayoutParams(dpToPx(40), dpToPx(40)));
                     loadSiteOgPhotoAsync(site, icon, siteColorInt);
 
@@ -1494,14 +1579,16 @@ public class HomeActivity extends AppCompatActivity {
                         dismissPopupWithAnimation(dialog, animTarget, () -> switchToSiteInstant(site, false));
                     });
 
-                    animateCascadeItem(itemLayout, 40 + (40 * Math.min(i, 3)));
+                    prepareCascadeView(itemLayout);
+                    cascadeViews.add(itemLayout);
                     container.addView(itemLayout);
                 }
             }
 
             View btnMedia = dialogView.findViewById(R.id.btnDialogTheme);
             if (btnMedia != null) {
-                animateCascadeItem(btnMedia, 120);
+                prepareCascadeView(btnMedia);
+                cascadeViews.add(btnMedia);
                 attachTouchBounceAnimation(btnMedia);
                 btnMedia.setOnClickListener(v -> {
                     dismissPopupWithAnimation(dialog, animTarget, this::showMediaDownloadsDialog);
@@ -1510,7 +1597,8 @@ public class HomeActivity extends AppCompatActivity {
 
             View btnDownloader = dialogView.findViewById(R.id.btnDialogDownloader);
             if (btnDownloader != null) {
-                animateCascadeItem(btnDownloader, 145);
+                prepareCascadeView(btnDownloader);
+                cascadeViews.add(btnDownloader);
                 attachTouchBounceAnimation(btnDownloader);
                 btnDownloader.setOnClickListener(v -> {
                     dismissPopupWithAnimation(dialog, animTarget, () -> showUniversalLinkDownloaderDialog(""));
@@ -1519,7 +1607,8 @@ public class HomeActivity extends AppCompatActivity {
 
             View btnAddSite = dialogView.findViewById(R.id.btnDialogAddSite);
             if (btnAddSite != null) {
-                animateCascadeItem(btnAddSite, 170);
+                prepareCascadeView(btnAddSite);
+                cascadeViews.add(btnAddSite);
                 attachTouchBounceAnimation(btnAddSite);
                 btnAddSite.setOnClickListener(v -> {
                     dismissPopupWithAnimation(dialog, animTarget, this::showSiteManagerDialog);
@@ -1528,7 +1617,8 @@ public class HomeActivity extends AppCompatActivity {
 
             View btnSettings = dialogView.findViewById(R.id.btnDialogSettings);
             if (btnSettings != null) {
-                animateCascadeItem(btnSettings, 195);
+                prepareCascadeView(btnSettings);
+                cascadeViews.add(btnSettings);
                 attachTouchBounceAnimation(btnSettings);
                 btnSettings.setOnClickListener(v -> {
                     dismissPopupWithAnimation(dialog, animTarget, this::showAllSettingsDialog);
@@ -1543,7 +1633,8 @@ public class HomeActivity extends AppCompatActivity {
 
             View btnQuickDark = dialogView.findViewById(R.id.btnQuickDark);
             if (btnQuickDark != null) {
-                animateCascadeItem(btnQuickDark, 215);
+                prepareCascadeView(btnQuickDark);
+                cascadeViews.add(btnQuickDark);
                 attachTouchBounceAnimation(btnQuickDark);
                 btnQuickDark.setOnClickListener(v -> {
                     darkModeEnabled = !darkModeEnabled;
@@ -1558,7 +1649,8 @@ public class HomeActivity extends AppCompatActivity {
 
             View btnQuickAppLock = dialogView.findViewById(R.id.btnQuickAppLock);
             if (btnQuickAppLock != null) {
-                animateCascadeItem(btnQuickAppLock, 235);
+                prepareCascadeView(btnQuickAppLock);
+                cascadeViews.add(btnQuickAppLock);
                 attachTouchBounceAnimation(btnQuickAppLock);
                 btnQuickAppLock.setOnClickListener(v -> {
                     dismissPopupWithAnimation(dialog, animTarget, this::showAppLockDialog);
@@ -1573,7 +1665,8 @@ public class HomeActivity extends AppCompatActivity {
 
             View btnQuickEco = dialogView.findViewById(R.id.btnQuickEco);
             if (btnQuickEco != null) {
-                animateCascadeItem(btnQuickEco, 255);
+                prepareCascadeView(btnQuickEco);
+                cascadeViews.add(btnQuickEco);
                 attachTouchBounceAnimation(btnQuickEco);
                 btnQuickEco.setOnClickListener(v -> {
                     dismissPopupWithAnimation(dialog, animTarget, this::showBatterySaverDialog);
@@ -1582,7 +1675,8 @@ public class HomeActivity extends AppCompatActivity {
 
             View btnQuickAdBlock = dialogView.findViewById(R.id.btnQuickAdBlock);
             if (btnQuickAdBlock != null) {
-                animateCascadeItem(btnQuickAdBlock, 275);
+                prepareCascadeView(btnQuickAdBlock);
+                cascadeViews.add(btnQuickAdBlock);
                 attachTouchBounceAnimation(btnQuickAdBlock);
                 btnQuickAdBlock.setOnClickListener(v -> {
                     dismissPopupWithAnimation(dialog, animTarget, this::showPrivateDnsSetupDialog);
@@ -1591,43 +1685,89 @@ public class HomeActivity extends AppCompatActivity {
 
             View btnQuickCache = dialogView.findViewById(R.id.btnQuickCache);
             if (btnQuickCache != null) {
-                animateCascadeItem(btnQuickCache, 295);
+                prepareCascadeView(btnQuickCache);
+                cascadeViews.add(btnQuickCache);
                 attachTouchBounceAnimation(btnQuickCache);
                 btnQuickCache.setOnClickListener(v -> {
                     dismissPopupWithAnimation(dialog, animTarget, this::clearAppCacheNow);
                 });
             }
 
+            final View cardFlashBadge = dialogView.findViewById(R.id.cardFlashBadge);
+
+            dialog.setOnShowListener(d -> {
+                forceEnableAnimations();
+                animTarget.animate()
+                        .alpha(1f)
+                        .scaleX(1f)
+                        .scaleY(1f)
+                        .translationY(0f)
+                        .setDuration(350)
+                        .setInterpolator(new OvershootInterpolator(1.30f))
+                        .start();
+
+                for (int idx = 0; idx < cascadeViews.size(); idx++) {
+                    View cv = cascadeViews.get(idx);
+                    animateCascadeItemNow(cv, 25 + (idx * 24));
+                }
+
+                if (rootCard != null) {
+                    ValueAnimator borderGlow = ValueAnimator.ofArgb(
+                            Color.parseColor("#00F5A0"),
+                            Color.parseColor("#00E5FF"),
+                            Color.parseColor("#7C3AED"),
+                            Color.parseColor("#00F5A0"));
+                    borderGlow.setDuration(3000);
+                    borderGlow.setRepeatCount(ValueAnimator.INFINITE);
+                    borderGlow.addUpdateListener(a -> rootCard.setStrokeColor((int) a.getAnimatedValue()));
+                    borderGlow.start();
+                    activePopupAnimators.add(borderGlow);
+                }
+
+                if (cardFlashBadge != null) {
+                    ObjectAnimator logoPulse = ObjectAnimator.ofPropertyValuesHolder(
+                            cardFlashBadge,
+                            PropertyValuesHolder.ofFloat("scaleX", 1f, 1.12f, 1f),
+                            PropertyValuesHolder.ofFloat("scaleY", 1f, 1.12f, 1f)
+                    );
+                    logoPulse.setDuration(1800);
+                    logoPulse.setRepeatCount(ValueAnimator.INFINITE);
+                    logoPulse.start();
+                    activePopupAnimators.add(logoPulse);
+                }
+            });
+
+            dialog.setOnDismissListener(d -> stopPopupAnimators());
             dialog.show();
         } catch (Exception e) {
             Toast.makeText(this, "Error: " + e.getMessage(), Toast.LENGTH_SHORT).show();
         }
     }
 
-    private void animateCascadeItem(final View view, int delayMs) {
+    private void prepareCascadeView(View view) {
+        if (view == null) return;
         view.setAlpha(0f);
-        view.setTranslationY(dpToPx(18));
-        view.setScaleX(0.92f);
-        view.setScaleY(0.92f);
-        view.post(() -> {
-            view.animate()
-                    .alpha(1f)
-                    .translationY(0f)
-                    .scaleX(1f)
-                    .scaleY(1f)
-                    .setStartDelay(delayMs)
-                    .setDuration(250)
-                    .setInterpolator(new OvershootInterpolator(1.15f))
-                    .start();
-        });
+        view.setTranslationY(dpToPx(22));
+        view.setScaleX(0.90f);
+        view.setScaleY(0.90f);
     }
 
-    // =========================================================================
-    // Smart Universal Downloader Dialog (With Instant Detected Video + Link Paste)
-    // =========================================================================
+    private void animateCascadeItemNow(final View view, int delayMs) {
+        if (view == null) return;
+        view.animate()
+                .alpha(1f)
+                .translationY(0f)
+                .scaleX(1f)
+                .scaleY(1f)
+                .setStartDelay(delayMs)
+                .setDuration(280)
+                .setInterpolator(new OvershootInterpolator(1.18f))
+                .start();
+    }
+
     private void showUniversalLinkDownloaderDialog(String prefillUrl) {
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
-        LinearLayout root = createStyledDialogCard();
+        final LinearLayout root = createStyledDialogCard();
 
         TextView title = new TextView(this);
         title.setText("New Download");
@@ -1646,7 +1786,6 @@ public class HomeActivity extends AppCompatActivity {
             dialog.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
         }
 
-        // যদি বর্তমান পেজে কোনো ভিডিও প্লে হয়ে থাকে, তবে ১-ট্যাপে ডাউনলোডের জন্য Instant Detected Card দেখাবে
         if (!liveDetectedStreamsMap.isEmpty()) {
             List<Map.Entry<String, String>> entries = new ArrayList<>(liveDetectedStreamsMap.entrySet());
             final Map.Entry<String, String> latest = entries.get(entries.size() - 1);
@@ -1654,10 +1793,11 @@ public class HomeActivity extends AppCompatActivity {
             final String detectedTitle = latest.getValue();
 
             View instantBtn = createCompactSettingRow("⚡  " + detectedTitle, "Download Now", "#00F5A0", v -> {
-                dialog.dismiss();
-                String referer = (webView != null && webView.getUrl() != null) ? webView.getUrl() : detectedStreamUrl;
-                boolean isHls = detectedStreamUrl.toLowerCase(Locale.ROOT).contains(".m3u8");
-                launchBestDownloadEngine(detectedStreamUrl, referer, detectedTitle, isHls);
+                dismissPopupWithAnimation(dialog, root, () -> {
+                    String referer = (webView != null && webView.getUrl() != null) ? webView.getUrl() : detectedStreamUrl;
+                    boolean isHls = detectedStreamUrl.toLowerCase(Locale.ROOT).contains(".m3u8");
+                    launchBestDownloadEngine(detectedStreamUrl, referer, detectedTitle, isHls);
+                });
             });
             root.addView(instantBtn);
         }
@@ -1677,6 +1817,7 @@ public class HomeActivity extends AppCompatActivity {
         LinearLayout.LayoutParams p1 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
         p1.setMargins(0, 0, dpToPx(5), 0);
         btnPasteClip.setLayoutParams(p1);
+        attachTouchBounceAnimation(btnPasteClip);
         btnPasteClip.setOnClickListener(v -> {
             try {
                 ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
@@ -1693,6 +1834,7 @@ public class HomeActivity extends AppCompatActivity {
         LinearLayout.LayoutParams p2 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
         p2.setMargins(dpToPx(5), 0, 0, 0);
         btnUseCurrentPage.setLayoutParams(p2);
+        attachTouchBounceAnimation(btnUseCurrentPage);
         btnUseCurrentPage.setOnClickListener(v -> {
             if (webView != null && webView.getUrl() != null && webView.getUrl().startsWith("http")) {
                 inputLink.setText(webView.getUrl());
@@ -1711,13 +1853,15 @@ public class HomeActivity extends AppCompatActivity {
         bottomRow.setGravity(Gravity.END);
 
         TextView btnCancel = createDialogButton("Cancel", "#94A3B8", "#1E2230");
-        btnCancel.setOnClickListener(v -> dialog.dismiss());
+        attachTouchBounceAnimation(btnCancel);
+        btnCancel.setOnClickListener(v -> dismissPopupWithAnimation(dialog, root, null));
 
         final TextView btnStartDl = createDialogButton("Download", "#06101E", "#00F5A0");
         LinearLayout.LayoutParams dlParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         dlParams.setMargins(dpToPx(8), 0, 0, 0);
         btnStartDl.setLayoutParams(dlParams);
+        attachTouchBounceAnimation(btnStartDl);
 
         btnStartDl.setOnClickListener(v -> {
             String rawUrl = inputLink.getText().toString().trim();
@@ -1741,7 +1885,7 @@ public class HomeActivity extends AppCompatActivity {
         bottomRow.addView(btnStartDl);
         root.addView(bottomRow);
 
-        dialog.show();
+        showAnimatedDialog(dialog, root);
     }
 
     static class ExtractedMediaCandidate {
@@ -2168,7 +2312,7 @@ public class HomeActivity extends AppCompatActivity {
         }
 
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
-        LinearLayout root = createStyledDialogCard();
+        final LinearLayout root = createStyledDialogCard();
 
         TextView title = new TextView(this);
         title.setText("Select Quality");
@@ -2195,8 +2339,7 @@ public class HomeActivity extends AppCompatActivity {
         for (int i = 0; i < Math.min(candidates.size(), 8); i++) {
             final ExtractedMediaCandidate item = candidates.get(i);
             View row = createCompactSettingRow("⬇  " + item.label, item.isHls ? "Stream" : "Direct", "#00F5A0", v -> {
-                qDialog.dismiss();
-                launchBestDownloadEngine(item.url, refererPageUrl, baseTitle, item.isHls);
+                dismissPopupWithAnimation(qDialog, root, () -> launchBestDownloadEngine(item.url, refererPageUrl, baseTitle, item.isHls));
             });
             list.addView(row);
         }
@@ -2205,11 +2348,12 @@ public class HomeActivity extends AppCompatActivity {
         bottomRow.setGravity(Gravity.END);
         bottomRow.setPadding(0, dpToPx(8), 0, 0);
         TextView btnClose = createDialogButton("Cancel", "#94A3B8", "#1E2230");
-        btnClose.setOnClickListener(v -> qDialog.dismiss());
+        attachTouchBounceAnimation(btnClose);
+        btnClose.setOnClickListener(v -> dismissPopupWithAnimation(qDialog, root, null));
         bottomRow.addView(btnClose);
         root.addView(bottomRow);
 
-        qDialog.show();
+        showAnimatedDialog(qDialog, root);
     }
 
     private void launchBestDownloadEngine(String mediaUrl, String refererUrl, String customTitle, boolean isHlsStream) {
@@ -2329,9 +2473,6 @@ public class HomeActivity extends AppCompatActivity {
         });
     }
 
-    // =========================================================================
-    // 4x Multi-Threaded Parallel Range + Auto-Resume Turbo Download Engine
-    // =========================================================================
     private void executeDirectHttpTurboDownload(final CustomDownloadTask task, final String refererUrl) {
         HttpURLConnection conn = null;
         try {
@@ -2388,7 +2529,6 @@ public class HomeActivity extends AppCompatActivity {
             }
             task.totalBytes = contentLen;
 
-            // যদি ফাইলটি ২ মেগাবাইটের বড় হয় এবং সার্ভার Range সাপোর্ট করে, তবে ৪টি থ্রেডে একসাথে ৪ গুণ দ্রুত ডাউনলোড করবে!
             if (supportsRange && contentLen > (2L * 1024L * 1024L)) {
                 conn.disconnect();
                 conn = null;
@@ -2401,7 +2541,6 @@ public class HomeActivity extends AppCompatActivity {
                     cancelOrRemoveDownloadStatic(appContextRef, task.id);
                     return;
                 }
-                // যদি কোনো CDN প্যারালাল কানেকশন লিমিট করে, তবে সিঙ্গেল স্ট্রিম রিজিউম মোডে ফলব্যাক করবে
                 task.downloadedBytes.set(0);
                 conn = openBrowserLikeConnectionWithRedirects(finalUrl, refererUrl, null);
             }
@@ -2555,9 +2694,6 @@ public class HomeActivity extends AppCompatActivity {
         mainHandler.post(() -> Toast.makeText(appContextRef, "Completed: " + task.title, Toast.LENGTH_SHORT).show());
     }
 
-    // =========================================================================
-    // 4x Parallel Batch HLS (.m3u8) Segment Downloader
-    // =========================================================================
     private void executeHlsM3u8Download(final CustomDownloadTask task, final String refererUrl) {
         FileOutputStream fos = null;
         try {
@@ -2577,11 +2713,15 @@ public class HomeActivity extends AppCompatActivity {
                         if (m.find() && m.group(1) != null) {
                             bw = Long.parseLong(m.group(1));
                         }
-                        if (i + 1 < lines.length) {
-                            String next = lines[i + 1].trim();
-                            if (!next.isEmpty() && !next.startsWith("#") && bw >= bestBw) {
-                                bestBw = bw;
-                                bestSubUrl = resolveRelativeUrl(activePlaylistUrl, next);
+                        for (int k = i + 1; k < lines.length; k++) {
+                            String next = lines[k].trim();
+                            if (next.isEmpty()) continue;
+                            if (!next.startsWith("#")) {
+                                if (bw >= bestBw) {
+                                    bestBw = bw;
+                                    bestSubUrl = resolveRelativeUrl(activePlaylistUrl, next);
+                                }
+                                break;
                             }
                         }
                     }
@@ -2594,10 +2734,35 @@ public class HomeActivity extends AppCompatActivity {
             }
 
             final List<String> segmentUrls = new ArrayList<>();
+            byte[] aesKeyBytes = null;
+            byte[] aesCustomIv = null;
+            int mediaSequenceBase = 0;
+
             for (String line : playlistText.split("\n")) {
                 String trimmed = line.trim();
                 if (trimmed.isEmpty()) continue;
-                if (trimmed.startsWith("#EXT-X-MAP:")) {
+                if (trimmed.startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
+                    try {
+                        mediaSequenceBase = Integer.parseInt(trimmed.substring("#EXT-X-MEDIA-SEQUENCE:".length()).trim());
+                    } catch (Exception ignored) {}
+                } else if (trimmed.startsWith("#EXT-X-KEY:") && trimmed.contains("METHOD=AES-128")) {
+                    Matcher keyUriMatcher = Pattern.compile("URI=\"([^\"]+)\"").matcher(trimmed);
+                    if (keyUriMatcher.find() && keyUriMatcher.group(1) != null) {
+                        String keyUrl = resolveRelativeUrl(activePlaylistUrl, keyUriMatcher.group(1));
+                        byte[] fetchedKey = downloadSegmentBytesWithRetry(keyUrl, refererUrl, task);
+                        if (fetchedKey != null && fetchedKey.length == 16) {
+                            aesKeyBytes = fetchedKey;
+                        }
+                    }
+                    Matcher ivMatcher = Pattern.compile("IV=0[xX]([0-9a-fA-F]{32})").matcher(trimmed);
+                    if (ivMatcher.find() && ivMatcher.group(1) != null) {
+                        String hexIv = ivMatcher.group(1);
+                        aesCustomIv = new byte[16];
+                        for (int b = 0; b < 16; b++) {
+                            aesCustomIv[b] = (byte) Integer.parseInt(hexIv.substring(b * 2, b * 2 + 2), 16);
+                        }
+                    }
+                } else if (trimmed.startsWith("#EXT-X-MAP:")) {
                     Matcher mapMatcher = Pattern.compile("URI=\"([^\"]+)\"").matcher(trimmed);
                     if (mapMatcher.find() && mapMatcher.group(1) != null) {
                         segmentUrls.add(resolveRelativeUrl(activePlaylistUrl, mapMatcher.group(1)));
@@ -2612,6 +2777,10 @@ public class HomeActivity extends AppCompatActivity {
                 return;
             }
 
+            final byte[] finalAesKey = aesKeyBytes;
+            final byte[] finalAesIv = aesCustomIv;
+            final int finalSeqBase = mediaSequenceBase;
+
             task.totalSegments = segmentUrls.size();
             fos = new FileOutputStream(task.outputFile);
             long lastTick = System.currentTimeMillis();
@@ -2624,8 +2793,15 @@ public class HomeActivity extends AppCompatActivity {
                 List<Callable<byte[]>> batchCallables = new ArrayList<>();
 
                 for (int j = baseIdx; j < endIdx; j++) {
+                    final int segIndex = j;
                     final String segUrl = segmentUrls.get(j);
-                    batchCallables.add(() -> downloadSegmentBytesWithRetry(segUrl, refererUrl, task));
+                    batchCallables.add(() -> {
+                        byte[] rawSeg = downloadSegmentBytesWithRetry(segUrl, refererUrl, task);
+                        if (rawSeg != null && finalAesKey != null) {
+                            return decryptAes128Segment(rawSeg, finalAesKey, finalAesIv, finalSeqBase + segIndex);
+                        }
+                        return rawSeg;
+                    });
                 }
 
                 List<Future<byte[]>> batchFutures = parallelChunkPool.invokeAll(batchCallables);
@@ -2665,6 +2841,27 @@ public class HomeActivity extends AppCompatActivity {
             }
         } finally {
             try { if (fos != null) fos.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    private byte[] decryptAes128Segment(byte[] encryptedData, byte[] keyBytes, byte[] customIv, int sequenceNumber) {
+        try {
+            byte[] ivBytes = new byte[16];
+            if (customIv != null && customIv.length == 16) {
+                System.arraycopy(customIv, 0, ivBytes, 0, 16);
+            } else {
+                ivBytes[12] = (byte) ((sequenceNumber >> 24) & 0xFF);
+                ivBytes[13] = (byte) ((sequenceNumber >> 16) & 0xFF);
+                ivBytes[14] = (byte) ((sequenceNumber >> 8) & 0xFF);
+                ivBytes[15] = (byte) (sequenceNumber & 0xFF);
+            }
+            SecretKeySpec keySpec = new SecretKeySpec(keyBytes, "AES");
+            IvParameterSpec ivSpec = new IvParameterSpec(ivBytes);
+            Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+            cipher.init(Cipher.DECRYPT_MODE, keySpec, ivSpec);
+            return cipher.doFinal(encryptedData);
+        } catch (Exception e) {
+            return encryptedData;
         }
     }
 
@@ -2772,14 +2969,11 @@ public class HomeActivity extends AppCompatActivity {
                 || clean.endsWith(".mp3") || clean.endsWith(".zip") || clean.endsWith(".apk");
     }
 
-    // =========================================================================
-    // Clean, Real Downloads Dialog (Shows ONLY ProStream Downloads, Never Chrome Cache!)
-    // =========================================================================
     private void showMediaDownloadsDialog() {
         startNotificationProgressTrackerStatic(appContextRef);
 
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
-        LinearLayout root = createStyledDialogCard();
+        final LinearLayout root = createStyledDialogCard();
 
         LinearLayout headerRow = new LinearLayout(this);
         headerRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -2800,6 +2994,7 @@ public class HomeActivity extends AppCompatActivity {
         btnClearDone.setTextSize(12f);
         btnClearDone.setTypeface(modernFont, Typeface.BOLD);
         btnClearDone.setPadding(dpToPx(8), dpToPx(4), dpToPx(8), dpToPx(4));
+        attachTouchBounceAnimation(btnClearDone);
         headerRow.addView(btnClearDone);
 
         root.addView(headerRow);
@@ -2839,13 +3034,14 @@ public class HomeActivity extends AppCompatActivity {
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         ndParams.setMargins(0, 0, dpToPx(8), 0);
         btnNewDl.setLayoutParams(ndParams);
+        attachTouchBounceAnimation(btnNewDl);
         btnNewDl.setOnClickListener(v -> {
-            dialog.dismiss();
-            showUniversalLinkDownloaderDialog("");
+            dismissPopupWithAnimation(dialog, root, () -> showUniversalLinkDownloaderDialog(""));
         });
 
         TextView btnClose = createDialogButton("Close", "#94A3B8", "#1E2230");
-        btnClose.setOnClickListener(v -> dialog.dismiss());
+        attachTouchBounceAnimation(btnClose);
+        btnClose.setOnClickListener(v -> dismissPopupWithAnimation(dialog, root, null));
 
         bottomRow.addView(btnNewDl);
         bottomRow.addView(btnClose);
@@ -2867,7 +3063,7 @@ public class HomeActivity extends AppCompatActivity {
         });
 
         populateLiveDownloadsList(listContainer, dialog);
-        dialog.show();
+        showAnimatedDialog(dialog, root);
         mainHandler.postDelayed(mediaLiveRefreshRunnable, 1000);
     }
 
@@ -3019,19 +3215,142 @@ public class HomeActivity extends AppCompatActivity {
         }
     }
 
-    private void openDownloadedVideoItem(String publicUriStr, String fallbackPath) {
+    private void openDownloadedVideoItem(final String publicUriStr, final String fallbackPath) {
+        File localFile = (fallbackPath != null && !fallbackPath.isEmpty()) ? new File(fallbackPath) : null;
+        final boolean hasLocalFile = (localFile != null && localFile.exists() && localFile.length() > 0);
+        final boolean hasContentUri = (publicUriStr != null && publicUriStr.startsWith("content://"));
+
+        if (!hasLocalFile && !hasContentUri) {
+            Toast.makeText(this, "Video file not found on storage", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
         try {
-            if (publicUriStr != null && !publicUriStr.isEmpty()) {
+            AlertDialog.Builder builder = new AlertDialog.Builder(this);
+            final LinearLayout root = createStyledDialogCard();
+
+            LinearLayout header = new LinearLayout(this);
+            header.setOrientation(LinearLayout.HORIZONTAL);
+            header.setGravity(Gravity.CENTER_VERTICAL);
+            header.setPadding(0, 0, 0, dpToPx(10));
+
+            TextView tvTitle = new TextView(this);
+            tvTitle.setText(localFile != null ? localFile.getName() : "ProStream Player");
+            tvTitle.setTextColor(Color.WHITE);
+            tvTitle.setTextSize(15f);
+            tvTitle.setTypeface(modernFont, Typeface.BOLD);
+            tvTitle.setSingleLine(true);
+            tvTitle.setEllipsize(TextUtils.TruncateAt.END);
+            tvTitle.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            header.addView(tvTitle);
+            root.addView(header);
+
+            FrameLayout videoContainer = new FrameLayout(this);
+            LinearLayout.LayoutParams vcParams = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, dpToPx(240));
+            vcParams.setMargins(0, 0, 0, dpToPx(12));
+            videoContainer.setLayoutParams(vcParams);
+            videoContainer.setBackgroundColor(Color.BLACK);
+
+            final VideoView videoView = new VideoView(this);
+            FrameLayout.LayoutParams vvParams = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.CENTER);
+            videoView.setLayoutParams(vvParams);
+            videoContainer.addView(videoView);
+            root.addView(videoContainer);
+
+            builder.setView(root);
+            final AlertDialog playerDialog = builder.create();
+            if (playerDialog.getWindow() != null) {
+                playerDialog.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            }
+
+            try {
+                MediaController mc = new MediaController(this);
+                mc.setAnchorView(videoContainer);
+                videoView.setMediaController(mc);
+                if (hasLocalFile) {
+                    videoView.setVideoPath(localFile.getAbsolutePath());
+                } else {
+                    videoView.setVideoURI(Uri.parse(publicUriStr));
+                }
+                videoView.setOnPreparedListener(mp -> {
+                    mp.setLooping(false);
+                    videoView.start();
+                });
+                videoView.setOnErrorListener((mp, what, extra) -> {
+                    playerDialog.dismiss();
+                    launchExternalVideoPlayerContentUri(publicUriStr, fallbackPath);
+                    return true;
+                });
+            } catch (Exception e) {
+                launchExternalVideoPlayerContentUri(publicUriStr, fallbackPath);
+                return;
+            }
+
+            LinearLayout bottomRow = new LinearLayout(this);
+            bottomRow.setOrientation(LinearLayout.HORIZONTAL);
+            bottomRow.setGravity(Gravity.END);
+
+            if (hasContentUri) {
+                TextView btnExternal = createDialogButton("External Player", "#7DD3FC", "#13263B");
+                LinearLayout.LayoutParams extParams = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                extParams.setMargins(0, 0, dpToPx(8), 0);
+                btnExternal.setLayoutParams(extParams);
+                attachTouchBounceAnimation(btnExternal);
+                btnExternal.setOnClickListener(v -> {
+                    try { videoView.stopPlayback(); } catch (Exception ignored) {}
+                    dismissPopupWithAnimation(playerDialog, root, () -> launchExternalVideoPlayerContentUri(publicUriStr, fallbackPath));
+                });
+                bottomRow.addView(btnExternal);
+            }
+
+            TextView btnClose = createDialogButton("Close", "#06101E", "#00F5A0");
+            attachTouchBounceAnimation(btnClose);
+            btnClose.setOnClickListener(v -> {
+                try { videoView.stopPlayback(); } catch (Exception ignored) {}
+                dismissPopupWithAnimation(playerDialog, root, null);
+            });
+            bottomRow.addView(btnClose);
+            root.addView(bottomRow);
+
+            playerDialog.setOnDismissListener(d -> {
+                try { videoView.stopPlayback(); } catch (Exception ignored) {}
+            });
+
+            showAnimatedDialog(playerDialog, root);
+        } catch (Exception e) {
+            launchExternalVideoPlayerContentUri(publicUriStr, fallbackPath);
+        }
+    }
+
+    private void launchExternalVideoPlayerContentUri(String publicUriStr, String fallbackPath) {
+        try {
+            if (publicUriStr != null && publicUriStr.startsWith("content://")) {
+                launchingInternalActivity = true;
                 Intent openIntent = new Intent(Intent.ACTION_VIEW);
                 openIntent.setDataAndType(Uri.parse(publicUriStr), "video/*");
                 openIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
-                startActivity(Intent.createChooser(openIntent, "Open Video"));
+                startActivity(Intent.createChooser(openIntent, "Play Video"));
                 return;
             }
+            if (fallbackPath != null && !fallbackPath.isEmpty()) {
+                File f = new File(fallbackPath);
+                if (f.exists()) {
+                    String exportedUri = exportCompletedFileToPublicDownloads(f, f.getName());
+                    if (exportedUri != null && exportedUri.startsWith("content://")) {
+                        launchingInternalActivity = true;
+                        Intent openIntent = new Intent(Intent.ACTION_VIEW);
+                        openIntent.setDataAndType(Uri.parse(exportedUri), "video/*");
+                        openIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+                        startActivity(Intent.createChooser(openIntent, "Play Video"));
+                        return;
+                    }
+                }
+            }
         } catch (Exception ignored) {}
-        try {
-            startActivity(new Intent(DownloadManager.ACTION_VIEW_DOWNLOADS));
-        } catch (Exception ignored) {}
+        Toast.makeText(this, "Saved in Downloads/ProStream folder", Toast.LENGTH_LONG).show();
     }
 
     private void addMediaDownloadCardRow(LinearLayout container, long dlId, String fileTitle, String statusText, String badgeColor, int percent, boolean isRunning, View.OnClickListener clickListener, View.OnClickListener removeListener) {
@@ -3087,6 +3406,7 @@ public class HomeActivity extends AppCompatActivity {
                 ViewGroup.LayoutParams.MATCH_PARENT, dpToPx(5)));
         card.addView(pb);
 
+        attachTouchBounceAnimation(card);
         card.setOnClickListener(clickListener);
         container.addView(card);
     }
@@ -3099,8 +3419,23 @@ public class HomeActivity extends AppCompatActivity {
                 || lowerUrl.endsWith(".ts")) {
             return;
         }
+        if (lowerUrl.startsWith("blob:")) {
+            if (!liveDetectedStreamsMap.isEmpty()) {
+                List<Map.Entry<String, String>> entries = new ArrayList<>(liveDetectedStreamsMap.entrySet());
+                Map.Entry<String, String> latest = entries.get(entries.size() - 1);
+                String detectedUrl = latest.getKey();
+                String detectedTitle = latest.getValue();
+                String ref = (webView != null && webView.getUrl() != null) ? webView.getUrl() : detectedUrl;
+                launchBestDownloadEngine(detectedUrl, ref, detectedTitle, detectedUrl.toLowerCase(Locale.ROOT).contains(".m3u8"));
+                return;
+            }
+            if (webView != null && webView.getUrl() != null) {
+                showUniversalLinkDownloaderDialog(webView.getUrl());
+                return;
+            }
+            return;
+        }
         if (!url.startsWith("http://") && !url.startsWith("https://")) {
-            openUrlSafely(url);
             return;
         }
 
@@ -3116,6 +3451,10 @@ public class HomeActivity extends AppCompatActivity {
 
     private void applyWebViewDarkMode(WebView targetView, boolean enableDark) {
         if (targetView == null) return;
+        String title = targetView.getTitle() != null ? targetView.getTitle().toLowerCase(Locale.ROOT) : "";
+        if (title.contains("just a moment") || title.contains("attention required")) {
+            return;
+        }
 
         String darkJs = enableDark
                 ? "(function(){" +
@@ -3135,7 +3474,7 @@ public class HomeActivity extends AppCompatActivity {
 
     private void showSiteManagerDialog() {
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
-        LinearLayout root = createStyledDialogCard();
+        final LinearLayout root = createStyledDialogCard();
 
         TextView title = new TextView(this);
         title.setText("Sites");
@@ -3181,7 +3520,6 @@ public class HomeActivity extends AppCompatActivity {
             row.setBackground(rowBg);
 
             ImageView icon = new ImageView(this);
-            icon.setImageBitmap(createRoundedLetterBitmap(s.name, cInt));
             icon.setLayoutParams(new LinearLayout.LayoutParams(dpToPx(36), dpToPx(36)));
             loadSiteOgPhotoAsync(s, icon, cInt);
 
@@ -3218,9 +3556,9 @@ public class HomeActivity extends AppCompatActivity {
             row.addView(col);
             row.addView(editBtn);
 
+            attachTouchBounceAnimation(row);
             row.setOnClickListener(v -> {
-                dialog.dismiss();
-                showAddOrEditSiteDialog(idx);
+                dismissPopupWithAnimation(dialog, root, () -> showAddOrEditSiteDialog(idx));
             });
             listContainer.addView(row);
         }
@@ -3231,23 +3569,24 @@ public class HomeActivity extends AppCompatActivity {
         bottomRow.setPadding(0, dpToPx(12), 0, 0);
 
         TextView btnClose = createDialogButton("Close", "#94A3B8", "#1E2230");
-        btnClose.setOnClickListener(v -> dialog.dismiss());
+        attachTouchBounceAnimation(btnClose);
+        btnClose.setOnClickListener(v -> dismissPopupWithAnimation(dialog, root, null));
 
         TextView btnAddNew = createDialogButton("+ Add Site", "#06101E", "#00F5A0");
         LinearLayout.LayoutParams addParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         addParams.setMargins(dpToPx(8), 0, 0, 0);
         btnAddNew.setLayoutParams(addParams);
+        attachTouchBounceAnimation(btnAddNew);
         btnAddNew.setOnClickListener(v -> {
-            dialog.dismiss();
-            showAddOrEditSiteDialog(-1);
+            dismissPopupWithAnimation(dialog, root, () -> showAddOrEditSiteDialog(-1));
         });
 
         bottomRow.addView(btnClose);
         bottomRow.addView(btnAddNew);
         root.addView(bottomRow);
 
-        dialog.show();
+        showAnimatedDialog(dialog, root);
     }
 
     private void showAddOrEditSiteDialog(final int editIndex) {
@@ -3255,7 +3594,7 @@ public class HomeActivity extends AppCompatActivity {
         final SiteItem existing = isNew ? new SiteItem("", "", "#00F5A0", "") : siteList.get(editIndex);
 
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
-        LinearLayout root = createStyledDialogCard();
+        final LinearLayout root = createStyledDialogCard();
 
         TextView title = new TextView(this);
         title.setText(isNew ? "Add Site" : "Edit Site");
@@ -3287,6 +3626,7 @@ public class HomeActivity extends AppCompatActivity {
                     ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             delParams.setMargins(0, 0, dpToPx(8), 0);
             btnDelete.setLayoutParams(delParams);
+            attachTouchBounceAnimation(btnDelete);
             btnDelete.setOnClickListener(v -> {
                 SiteItem removed = siteList.remove(editIndex);
                 WebView oldWv = webViewPool.remove(removed.url);
@@ -3295,20 +3635,21 @@ public class HomeActivity extends AppCompatActivity {
                     oldWv.destroy();
                 }
                 saveSitesToPrefs();
-                switchToSiteInstant(siteList.get(0), false);
-                dialog.dismiss();
+                dismissPopupWithAnimation(dialog, root, () -> switchToSiteInstant(siteList.get(0), false));
             });
             btnRow.addView(btnDelete);
         }
 
         TextView btnCancel = createDialogButton("Cancel", "#94A3B8", "#1E2230");
-        btnCancel.setOnClickListener(v -> dialog.dismiss());
+        attachTouchBounceAnimation(btnCancel);
+        btnCancel.setOnClickListener(v -> dismissPopupWithAnimation(dialog, root, null));
 
         TextView btnSave = createDialogButton("Save", "#06101E", "#00F5A0");
         LinearLayout.LayoutParams saveParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         saveParams.setMargins(dpToPx(8), 0, 0, 0);
         btnSave.setLayoutParams(saveParams);
+        attachTouchBounceAnimation(btnSave);
         btnSave.setOnClickListener(v -> {
             String n = inputName.getText().toString().trim();
             String u = inputUrl.getText().toString().trim();
@@ -3319,7 +3660,7 @@ public class HomeActivity extends AppCompatActivity {
                 u = "https://" + u;
             }
             String ogToKeep = (!isNew && existing.url.equalsIgnoreCase(u)) ? existing.ogImage : "";
-            SiteItem updated = new SiteItem(n, u, "#00F5A0", ogToKeep);
+            final SiteItem updated = new SiteItem(n, u, "#00F5A0", ogToKeep);
             if (isNew) {
                 siteList.add(updated);
             } else {
@@ -3333,15 +3674,15 @@ public class HomeActivity extends AppCompatActivity {
                 siteList.set(editIndex, updated);
             }
             saveSitesToPrefs();
-            switchToSiteInstant(updated, false);
-            dialog.dismiss();
+            preloadSiteOgBitmapInBackground(updated);
+            dismissPopupWithAnimation(dialog, root, () -> switchToSiteInstant(updated, false));
         });
 
         btnRow.addView(btnCancel);
         btnRow.addView(btnSave);
         root.addView(btnRow);
 
-        dialog.show();
+        showAnimatedDialog(dialog, root);
     }
 
     private WebView createConfiguredWebView(final SiteItem ownerSite) {
@@ -3362,10 +3703,6 @@ public class HomeActivity extends AppCompatActivity {
         settings.setCacheMode(WebSettings.LOAD_DEFAULT);
         settings.setAllowFileAccess(true);
         settings.setAllowContentAccess(true);
-        try {
-            settings.setAllowFileAccessFromFileURLs(true);
-            settings.setAllowUniversalAccessFromFileURLs(true);
-        } catch (Exception ignored) {}
         settings.setMediaPlaybackRequiresUserGesture(false);
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
         settings.setLoadWithOverviewMode(true);
@@ -3375,17 +3712,13 @@ public class HomeActivity extends AppCompatActivity {
         settings.setDisplayZoomControls(false);
         settings.setLoadsImagesAutomatically(true);
         settings.setGeolocationEnabled(true);
-        settings.setRenderPriority(WebSettings.RenderPriority.HIGH);
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            settings.setOffscreenPreRaster(true);
-        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             settings.setSafeBrowsingEnabled(false);
         }
 
-        settings.setJavaScriptCanOpenWindowsAutomatically(true);
-        settings.setSupportMultipleWindows(true);
+        settings.setJavaScriptCanOpenWindowsAutomatically(false);
+        settings.setSupportMultipleWindows(false);
         wv.setLayerType(View.LAYER_TYPE_HARDWARE, null);
         settings.setUserAgentString(browserUserAgent);
 
@@ -3414,15 +3747,45 @@ public class HomeActivity extends AppCompatActivity {
             }
 
             @Override
+            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                if (request != null && request.getUrl() != null) {
+                    String reqUrl = request.getUrl().toString();
+                    if (isBlockedAdUrl(reqUrl)) {
+                        return new WebResourceResponse(
+                                "text/plain",
+                                "UTF-8",
+                                new ByteArrayInputStream("".getBytes(StandardCharsets.UTF_8)));
+                    }
+                    if (isLikelyRealVideoStreamUrl(reqUrl)) {
+                        synchronized (liveDetectedStreamsMap) {
+                            if (!liveDetectedStreamsMap.containsKey(reqUrl)) {
+                                liveDetectedStreamsMap.put(reqUrl, "Detected Video");
+                            }
+                        }
+                    }
+                }
+                return super.shouldInterceptRequest(view, request);
+            }
+
+            @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 if (request == null || request.getUrl() == null) return false;
                 String url = request.getUrl().toString();
 
-                if (isImageOrFaviconUrl(url)) {
+                if (isImageOrFaviconUrl(url) || isBlockedAdUrl(url)) {
                     return true;
                 }
 
-                if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("blob:") || url.startsWith("data:")) {
+                if (url.startsWith("blob:")) {
+                    startProDownload(url, browserUserAgent, null, "video/mp4", null);
+                    return true;
+                }
+
+                if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("data:")) {
+                    if (isDirectMediaFileExtension(url)) {
+                        startProDownload(url, browserUserAgent, null, "video/mp4", null);
+                        return true;
+                    }
                     return false;
                 }
 
@@ -3431,12 +3794,8 @@ public class HomeActivity extends AppCompatActivity {
                         Intent intent = Intent.parseUri(url, Intent.URI_INTENT_SCHEME);
                         if (intent != null) {
                             String fallbackUrl = intent.getStringExtra("browser_fallback_url");
-                            if (fallbackUrl != null && !fallbackUrl.isEmpty()) {
+                            if (fallbackUrl != null && !fallbackUrl.isEmpty() && !isBlockedAdUrl(fallbackUrl)) {
                                 view.loadUrl(fallbackUrl);
-                                return true;
-                            }
-                            if (getPackageManager().resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY) != null) {
-                                startActivity(intent);
                                 return true;
                             }
                         }
@@ -3444,7 +3803,6 @@ public class HomeActivity extends AppCompatActivity {
                     return true;
                 }
 
-                openUrlSafely(url);
                 return true;
             }
 
@@ -3503,6 +3861,32 @@ public class HomeActivity extends AppCompatActivity {
             }
 
             @Override
+            public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+                try {
+                    if (view != null) {
+                        String keyToRemove = null;
+                        for (Map.Entry<String, WebView> entry : webViewPool.entrySet()) {
+                            if (entry.getValue() == view) {
+                                keyToRemove = entry.getKey();
+                                break;
+                            }
+                        }
+                        if (keyToRemove != null) {
+                            webViewPool.remove(keyToRemove);
+                        }
+                        if (webViewHolder != null) {
+                            webViewHolder.removeView(view);
+                        }
+                        view.destroy();
+                    }
+                    if (currentSite != null) {
+                        mainHandler.postDelayed(() -> switchToSiteInstantInternal(currentSite, true, false), 150);
+                    }
+                } catch (Throwable ignored) {}
+                return true;
+            }
+
+            @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 if (swipeRefresh != null && view == webView) {
@@ -3512,134 +3896,58 @@ public class HomeActivity extends AppCompatActivity {
                     progressBar.setVisibility(View.GONE);
                 }
 
+                if (clearHistoryOnLoadSet.remove(view)) {
+                    try {
+                        view.clearHistory();
+                    } catch (Exception ignored) {}
+                }
+
                 if (url == null || url.startsWith("about:blank")) {
                     return;
                 }
 
-                saveCookiesToVault(url);
+                CookieManager.getInstance().flush();
 
-                // সাইটের DOM বা target="_blank" পরিবর্তন করা হবে না, যাতে কোনো অ্যাড ওভারলে মেইন পেজ হাইজ্যাক করতে না পারে
-                String pageEnhancerScript = "(function(){" +
-                        "if(document.title==='Webpage not available' || (document.body && document.body.innerText.indexOf('ERR_INTERNET_DISCONNECTED')!==-1)){" +
-                        "return 'OFFLINE_PAGE_DETECTED';" +
-                        "}" +
-                        "var t=(document.title||'').toLowerCase();" +
-                        "if(t.indexOf('just a moment')!==-1 || t.indexOf('attention required')!==-1 || document.getElementById('cf-wrapper') || document.getElementById('challenge-running')){" +
-                        "var st=document.getElementById('ps-dark-style');if(st)st.remove();" +
-                        "return 'CF_PAGE';" +
-                        "}" +
-                        "try{" +
-                        "var vids=document.querySelectorAll('video');" +
-                        "for(var k=0;k<vids.length;k++){" +
-                        "vids[k].preload='auto';" +
-                        "vids[k].setAttribute('playsinline','true');" +
-                        "vids[k].setAttribute('webkit-playsinline','true');" +
-                        "}" +
-                        "}catch(e){}" +
-                        "var og=document.querySelector('meta[property=\"og:image\"]')||document.querySelector('meta[name=\"twitter:image\"]')||document.querySelector('link[rel*=\"apple-touch-icon\"]');" +
-                        "return og?(og.content||og.href||''):'';" +
-                        "})()";
+                String pageTitleLower = view.getTitle() != null ? view.getTitle().toLowerCase(Locale.ROOT) : "";
+                String urlLower = url.toLowerCase(Locale.ROOT);
+                if (pageTitleLower.contains("just a moment")
+                        || pageTitleLower.contains("attention required")
+                        || urlLower.contains("challenges.cloudflare.com")
+                        || urlLower.contains("/cdn-cgi/")) {
+                    return;
+                }
 
-                view.evaluateJavascript(pageEnhancerScript, val -> {
-                    String res = val != null ? val.replace("\"", "").trim() : "";
-                    if ("OFFLINE_PAGE_DETECTED".equals(res)) {
-                        lastFailedUrlMap.put(view, url);
-                        if (view == webView) {
-                            showModernOfflineScreen(url);
+                if (darkModeEnabled) {
+                    applyWebViewDarkMode(view, true);
+                }
+
+                if (ownerSite != null && isRootHomepageUrl(url, ownerSite.url)) {
+                    String ogExtractScript = "(function(){" +
+                            "var m=document.querySelector('meta[property=\"og:image\"]')" +
+                            "||document.querySelector('meta[name=\"og:image\"]')" +
+                            "||document.querySelector('meta[name=\"twitter:image\"]')" +
+                            "||document.querySelector('link[rel=\"image_src\"]')" +
+                            "||document.querySelector('link[rel*=\"apple-touch-icon\"]');" +
+                            "if(m){var c=m.content||m.href||'';if(c)return c;}" +
+                            "var lg=document.querySelector('header img, .logo img, img[src*=\"logo\"], img[alt*=\"logo\" i]');" +
+                            "return lg?(lg.src||''):'';" +
+                            "})();";
+                    view.evaluateJavascript(ogExtractScript, val -> {
+                        String res = val != null ? val.replace("\"", "").trim() : "";
+                        if (!res.isEmpty() && !res.equals("null")) {
+                            String absOg = resolveRelativeUrl(url, res);
+                            if (absOg.startsWith("http") && !absOg.equals(ownerSite.ogImage)) {
+                                ownerSite.ogImage = absOg;
+                                saveSitesToPrefs();
+                                preloadSiteOgBitmapInBackground(ownerSite);
+                            }
                         }
-                        return;
-                    }
-                    if ("CF_PAGE".equals(res)) {
-                        return;
-                    }
-                    if (ownerSite != null && url.startsWith("http") && !isImageOrFaviconUrl(url)) {
-                        ownerSite.lastVisitedUrl = url;
-                        saveCookiesToVault(url);
-                    }
-                    if (darkModeEnabled) {
-                        applyWebViewDarkMode(view, true);
-                    }
-                    if (!res.isEmpty() && !res.equals("null") && ownerSite != null) {
-                        String absOg = resolveRelativeUrl(url, res);
-                        if (!absOg.equals(ownerSite.ogImage)) {
-                            ownerSite.ogImage = absOg;
-                            saveSitesToPrefs();
-                        }
-                    }
-                });
+                    });
+                }
             }
         });
 
         wv.setWebChromeClient(new WebChromeClient() {
-            @Override
-            public boolean onCreateWindow(final WebView view, boolean isDialog, boolean isUserGesture, Message resultMsg) {
-                if (resultMsg == null) return false;
-                final String parentUrl = view != null ? view.getUrl() : "";
-
-                // সকল পপআপ ও নতুন ট্যাব ব্যাকগ্রাউন্ডে tempWebView-এর ভেতর নিরাপদে যাচাই করা হবে:
-                // ১. যদি এটি ফাইল ডাউনলোড হয় -> সাথে সাথে ডাউনলোড শুরু হবে
-                // ২. যদি এটি বৈধ ডাউনলোড সার্ভার হয় -> মেইন পেজে ওপেন হবে
-                // ৩. যদি এটি বিজ্ঞাপন বা পপআন্ডার হয় -> মেইন পেজকে বিরক্ত না করে নিঃশব্দে বন্ধ হয়ে যাবে!
-                final WebView tempWebView = new WebView(HomeActivity.this);
-                tempWebView.getSettings().setJavaScriptEnabled(true);
-                tempWebView.getSettings().setDomStorageEnabled(true);
-                tempWebView.getSettings().setUserAgentString(browserUserAgent);
-                CookieManager.getInstance().setAcceptThirdPartyCookies(tempWebView, true);
-
-                tempWebView.setDownloadListener((url, userAgent, contentDisposition, mimetype, contentLength) -> {
-                    startProDownload(url, userAgent, contentDisposition, mimetype, null);
-                    destroyTempWebViewSafely(tempWebView);
-                });
-
-                tempWebView.setWebViewClient(new WebViewClient() {
-                    private boolean handled = false;
-
-                    private boolean inspectPopupTarget(String targetUrl) {
-                        if (handled || targetUrl == null || targetUrl.isEmpty() || targetUrl.startsWith("about:blank")) {
-                            return false;
-                        }
-                        if (isImageOrFaviconUrl(targetUrl)) {
-                            handled = true;
-                            destroyTempWebViewSafely(tempWebView);
-                            return true;
-                        }
-                        if (isDirectMediaFileExtension(targetUrl) || isLikelyRealVideoStreamUrl(targetUrl)) {
-                            handled = true;
-                            startProDownload(targetUrl, browserUserAgent, null, "video/mp4", null);
-                            destroyTempWebViewSafely(tempWebView);
-                            return true;
-                        }
-                        if (isKnownDownloadServerOrSameSite(targetUrl, parentUrl)) {
-                            handled = true;
-                            loadUrlWithReferer(view, targetUrl, parentUrl);
-                            destroyTempWebViewSafely(tempWebView);
-                            return true;
-                        }
-                        return false;
-                    }
-
-                    @Override
-                    public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest req) {
-                        if (req != null && req.getUrl() != null) {
-                            return inspectPopupTarget(req.getUrl().toString());
-                        }
-                        return false;
-                    }
-
-                    @Override
-                    public void onPageStarted(WebView v, String url, Bitmap favicon) {
-                        inspectPopupTarget(url);
-                    }
-                });
-
-                mainHandler.postDelayed(() -> destroyTempWebViewSafely(tempWebView), 2500);
-
-                WebView.WebViewTransport transport = (WebView.WebViewTransport) resultMsg.obj;
-                transport.setWebView(tempWebView);
-                resultMsg.sendToTarget();
-                return true;
-            }
-
             @Override
             public void onPermissionRequest(final PermissionRequest request) {
                 runOnUiThread(() -> {
@@ -3663,6 +3971,7 @@ public class HomeActivity extends AppCompatActivity {
                 }
                 HomeActivity.this.filePathCallback = filePathCallback;
                 try {
+                    launchingInternalActivity = true;
                     Intent intent = fileChooserParams.createIntent();
                     startActivityForResult(intent, FILE_CHOOSER_REQUEST_CODE);
                 } catch (Exception e) {
@@ -3750,16 +4059,22 @@ public class HomeActivity extends AppCompatActivity {
         return wv;
     }
 
-    private void destroyTempWebViewSafely(final WebView tempWv) {
-        if (tempWv == null) return;
-        mainHandler.post(() -> {
-            try {
-                tempWv.setWebViewClient(null);
-                tempWv.setWebChromeClient(null);
-                tempWv.stopLoading();
-                tempWv.destroy();
-            } catch (Throwable ignored) {}
-        });
+    private boolean isRootHomepageUrl(String currentUrl, String siteBaseUrl) {
+        if (currentUrl == null || siteBaseUrl == null) return false;
+        try {
+            Uri cur = Uri.parse(currentUrl);
+            Uri base = Uri.parse(siteBaseUrl);
+            String curHost = cur.getHost() != null ? cur.getHost().replaceFirst("^www\\.", "") : "";
+            String baseHost = base.getHost() != null ? base.getHost().replaceFirst("^www\\.", "") : "";
+            if (!curHost.equalsIgnoreCase(baseHost)) {
+                return false;
+            }
+            String path = cur.getPath();
+            return path == null || path.isEmpty() || "/".equals(path)
+                    || "/index.html".equalsIgnoreCase(path) || "/index.php".equalsIgnoreCase(path);
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private boolean isImageOrFaviconUrl(String url) {
@@ -3778,63 +4093,10 @@ public class HomeActivity extends AppCompatActivity {
                 || pathOnly.endsWith(".bmp");
     }
 
-    private boolean isRealDownloadOrServerNavigation(String targetUrl, String parentUrl) {
-        if (targetUrl == null || targetUrl.isEmpty() || isImageOrFaviconUrl(targetUrl)) return false;
-        String lower = targetUrl.toLowerCase(Locale.ROOT);
-
-        String[] adKeywords = {
-                "doubleclick.net", "googlesyndication.com", "popads.net", "popcash.net",
-                "onclickalgo.com", "onclickperformance.com", "adsterra", "exoclick",
-                "juicyads", "propellerads", "hilltopads", "clickadu", "trafficjunky",
-                "acscdn.com", "histats.com", "bet365", "1xbet", "melbet", "mostbet"
-        };
-        for (String kw : adKeywords) {
-            if (lower.contains(kw)) return false;
-        }
-        return lower.startsWith("http://") || lower.startsWith("https://");
-    }
-
-    private boolean isKnownDownloadServerOrSameSite(String targetUrl, String parentUrl) {
-        if (!isRealDownloadOrServerNavigation(targetUrl, parentUrl)) return false;
-        String lower = targetUrl.toLowerCase(Locale.ROOT);
-
-        try {
-            String targetHost = Uri.parse(targetUrl).getHost();
-            String parentHost = parentUrl != null ? Uri.parse(parentUrl).getHost() : "";
-            if (targetHost != null && parentHost != null && !targetHost.isEmpty() && !parentHost.isEmpty()) {
-                if (targetHost.equalsIgnoreCase(parentHost) || targetHost.endsWith("." + parentHost) || parentHost.endsWith("." + targetHost)) {
-                    return true;
-                }
-            }
-        } catch (Exception ignored) {}
-
-        String[] trustedDownloadHosts = {
-                "speedostream", "hubcloud", "gdflix", "pixeldrain", "drive.google",
-                "mega.nz", "mediafire", "streamtape", "gofile", "1fichier", "katfile",
-                "usersdrive", "drop.download", "indiashare", "indishare", "bdupload",
-                "clicknupload", "filepress", "gdtot", "filemoon", "streamwish", "vidhide",
-                "dood", "voe.sx", "mixdrop", "/download", "/dl/", "/d/", "/f/", "/file/"
-        };
-        for (String h : trustedDownloadHosts) {
-            if (lower.contains(h)) return true;
-        }
-        return false;
-    }
-
-    private void loadUrlWithReferer(WebView targetWv, String url, String referer) {
-        if (targetWv == null || url == null || url.isEmpty() || isImageOrFaviconUrl(url)) return;
-        if (referer != null && !referer.isEmpty()) {
-            Map<String, String> headers = new HashMap<>();
-            headers.put("Referer", referer);
-            targetWv.loadUrl(url, headers);
-        } else {
-            targetWv.loadUrl(url);
-        }
-    }
-
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        launchingInternalActivity = false;
         if (requestCode == FILE_CHOOSER_REQUEST_CODE) {
             if (filePathCallback != null) {
                 Uri[] results = null;
@@ -3872,9 +4134,60 @@ public class HomeActivity extends AppCompatActivity {
         }
     }
 
-    private void loadSiteOgPhotoAsync(final SiteItem site, final ImageView targetView, final int fallbackColor) {
+    private File getPersistentSiteOgFile(SiteItem site) {
+        File dir = new File(getFilesDir(), "site_og_v6");
+        if (!dir.exists()) {
+            dir.mkdirs();
+        }
+        String hostKey = site.url != null ? site.url.toLowerCase(Locale.ROOT).replaceFirst("^https?://", "").replaceAll("[^a-z0-9]", "_") : "site";
+        return new File(dir, "og_" + hostKey + ".png");
+    }
+
+    private void preloadSiteOgBitmapInBackground(final SiteItem site) {
         if (site == null || site.url == null || site.url.isEmpty()) return;
-        final String cacheKey = "og_" + Math.abs(site.url.hashCode());
+        final String cacheKey = "og_v6_" + Math.abs(site.url.toLowerCase(Locale.ROOT).hashCode());
+        final int fallbackColor = parseColorSafe(site.color, appColor);
+
+        bgExecutor.execute(() -> {
+            try {
+                File ogFile = getPersistentSiteOgFile(site);
+                if (ogFile.exists() && ogFile.length() > 100 && (site.ogImage == null || site.ogImage.isEmpty())) {
+                    Bitmap diskBmp = BitmapFactory.decodeFile(ogFile.getAbsolutePath());
+                    if (diskBmp != null) {
+                        Bitmap rounded = makeRoundedPhotoBitmap(diskBmp, fallbackColor);
+                        ogMemoryCache.put(cacheKey, rounded);
+                        return;
+                    }
+                }
+
+                String ogUrl = site.ogImage;
+                if (ogUrl == null || ogUrl.isEmpty()) {
+                    ogUrl = fetchHomepageOgImageUrl(site.url);
+                    if (ogUrl != null && !ogUrl.isEmpty()) {
+                        site.ogImage = ogUrl;
+                        saveSitesToPrefs();
+                    }
+                }
+
+                if (ogUrl != null && !ogUrl.isEmpty()) {
+                    Bitmap rawBmp = downloadBitmapFromUrl(ogUrl, site.url);
+                    if (rawBmp != null && rawBmp.getWidth() > 8) {
+                        FileOutputStream fos = new FileOutputStream(ogFile);
+                        rawBmp.compress(Bitmap.CompressFormat.PNG, 92, fos);
+                        fos.close();
+
+                        Bitmap rounded = makeRoundedPhotoBitmap(rawBmp, fallbackColor);
+                        ogMemoryCache.put(cacheKey, rounded);
+                    }
+                }
+            } catch (Exception ignored) {}
+        });
+    }
+
+    private void loadSiteOgPhotoAsync(final SiteItem site, final ImageView targetView, final int fallbackColor) {
+        if (site == null || site.url == null || site.url.isEmpty() || targetView == null) return;
+        final String cacheKey = "og_v6_" + Math.abs(site.url.toLowerCase(Locale.ROOT).hashCode());
+        targetView.setTag(cacheKey);
 
         Bitmap memBmp = ogMemoryCache.get(cacheKey);
         if (memBmp != null) {
@@ -3882,60 +4195,112 @@ public class HomeActivity extends AppCompatActivity {
             return;
         }
 
+        targetView.setImageBitmap(createRoundedLetterBitmap(site.name, fallbackColor));
+
+        if (fetchingOgUrls.contains(cacheKey)) {
+            return;
+        }
+        fetchingOgUrls.add(cacheKey);
+
         bgExecutor.execute(() -> {
             try {
-                File cacheFile = new File(getCacheDir(), cacheKey + ".png");
-                if (cacheFile.exists() && cacheFile.length() > 100) {
-                    Bitmap diskBmp = BitmapFactory.decodeStream(new FileInputStream(cacheFile));
+                File ogFile = getPersistentSiteOgFile(site);
+                if (ogFile.exists() && ogFile.length() > 100) {
+                    Bitmap diskBmp = BitmapFactory.decodeFile(ogFile.getAbsolutePath());
                     if (diskBmp != null) {
-                        Bitmap rounded = makeRoundedPhotoBitmap(diskBmp, fallbackColor);
+                        final Bitmap rounded = makeRoundedPhotoBitmap(diskBmp, fallbackColor);
                         ogMemoryCache.put(cacheKey, rounded);
-                        mainHandler.post(() -> targetView.setImageBitmap(rounded));
+                        mainHandler.post(() -> {
+                            if (cacheKey.equals(targetView.getTag())) {
+                                targetView.setImageBitmap(rounded);
+                            }
+                        });
                         return;
                     }
                 }
 
                 String imageUrl = site.ogImage;
                 if (imageUrl == null || imageUrl.isEmpty()) {
-                    String host = Uri.parse(site.url).getHost();
-                    if (host != null) {
-                        imageUrl = "https://www.google.com/s2/favicons?sz=128&domain_url=" + host;
+                    imageUrl = fetchHomepageOgImageUrl(site.url);
+                    if (imageUrl != null && !imageUrl.isEmpty()) {
+                        site.ogImage = imageUrl;
+                        saveSitesToPrefs();
                     }
                 }
 
                 if (imageUrl != null && !imageUrl.isEmpty()) {
                     Bitmap rawBmp = downloadBitmapFromUrl(imageUrl, site.url);
                     if (rawBmp != null && rawBmp.getWidth() > 8) {
-                        FileOutputStream fos = new FileOutputStream(cacheFile);
-                        rawBmp.compress(Bitmap.CompressFormat.PNG, 90, fos);
+                        FileOutputStream fos = new FileOutputStream(ogFile);
+                        rawBmp.compress(Bitmap.CompressFormat.PNG, 92, fos);
                         fos.close();
 
-                        Bitmap rounded = makeRoundedPhotoBitmap(rawBmp, fallbackColor);
+                        final Bitmap rounded = makeRoundedPhotoBitmap(rawBmp, fallbackColor);
                         ogMemoryCache.put(cacheKey, rounded);
-                        mainHandler.post(() -> targetView.setImageBitmap(rounded));
+                        mainHandler.post(() -> {
+                            if (cacheKey.equals(targetView.getTag())) {
+                                targetView.setImageBitmap(rounded);
+                            }
+                        });
                     }
                 }
-            } catch (Exception ignored) {}
+            } catch (Exception ignored) {
+            } finally {
+                fetchingOgUrls.remove(cacheKey);
+            }
         });
+    }
+
+    private String fetchHomepageOgImageUrl(String siteHomeUrl) {
+        HttpURLConnection conn = null;
+        try {
+            conn = openBrowserLikeConnectionWithRedirects(siteHomeUrl, siteHomeUrl, null);
+            int code = conn.getResponseCode();
+            if (code < 200 || code >= 400) return "";
+            String finalBase = conn.getURL() != null ? conn.getURL().toString() : siteHomeUrl;
+
+            InputStream in = conn.getInputStream();
+            BufferedReader reader = new BufferedReader(new InputStreamReader(in));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null && sb.length() < 160000) {
+                sb.append(line).append("\n");
+                if (line.toLowerCase(Locale.ROOT).contains("</head>")) break;
+            }
+            reader.close();
+            String headHtml = sb.toString();
+
+            String[] patterns = {
+                    "<meta[^>]+property=[\"']og:image[\"'][^>]+content=[\"']([^\"']+)[\"']",
+                    "<meta[^>]+content=[\"']([^\"']+)[\"'][^>]+property=[\"']og:image[\"']",
+                    "<meta[^>]+name=[\"']og:image[\"'][^>]+content=[\"']([^\"']+)[\"']",
+                    "<meta[^>]+name=[\"']twitter:image[\"'][^>]+content=[\"']([^\"']+)[\"']",
+                    "<meta[^>]+content=[\"']([^\"']+)[\"'][^>]+name=[\"']twitter:image[\"']",
+                    "<link[^>]+rel=[\"']image_src[\"'][^>]+href=[\"']([^\"']+)[\"']",
+                    "<link[^>]+rel=[\"'][^\"']*apple-touch-icon[^\"']*[\"'][^>]+href=[\"']([^\"']+)[\"']"
+            };
+            for (String pat : patterns) {
+                Matcher m = Pattern.compile(pat, Pattern.CASE_INSENSITIVE).matcher(headHtml);
+                if (m.find() && m.group(1) != null) {
+                    String found = m.group(1).trim().replace("&amp;", "&");
+                    if (!found.isEmpty()) {
+                        return resolveRelativeUrl(finalBase, found);
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+        return "";
     }
 
     private Bitmap downloadBitmapFromUrl(String imgUrl, String refererUrl) {
         HttpURLConnection conn = null;
         try {
-            URL u = new URL(imgUrl);
-            conn = (HttpURLConnection) u.openConnection();
-            conn.setConnectTimeout(4500);
-            conn.setReadTimeout(4500);
-            conn.setInstanceFollowRedirects(true);
-            conn.setRequestProperty("User-Agent", browserUserAgent);
-            if (imgUrl.contains("google.com/s2/favicons")) {
-                conn.setRequestProperty("Accept", "image/*");
-            } else {
-                if (refererUrl != null) conn.setRequestProperty("Referer", refererUrl);
-                String cookies = CookieManager.getInstance().getCookie(refererUrl != null ? refererUrl : imgUrl);
-                if (cookies != null) conn.setRequestProperty("Cookie", cookies);
-            }
-
+            conn = openBrowserLikeConnectionWithRedirects(imgUrl, refererUrl, null);
+            conn.setConnectTimeout(6000);
+            conn.setReadTimeout(6000);
             InputStream in = conn.getInputStream();
             Bitmap bmp = BitmapFactory.decodeStream(in);
             in.close();
@@ -3985,7 +4350,7 @@ public class HomeActivity extends AppCompatActivity {
 
     private void showAppLockDialog() {
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
-        LinearLayout root = createStyledDialogCard();
+        final LinearLayout root = createStyledDialogCard();
 
         TextView title = new TextView(this);
         title.setText("App Lock");
@@ -4040,13 +4405,15 @@ public class HomeActivity extends AppCompatActivity {
         btnRow.setPadding(0, dpToPx(10), 0, 0);
 
         TextView btnCancel = createDialogButton("Cancel", "#94A3B8", "#1E2230");
-        btnCancel.setOnClickListener(v -> dialog.dismiss());
+        attachTouchBounceAnimation(btnCancel);
+        btnCancel.setOnClickListener(v -> dismissPopupWithAnimation(dialog, root, null));
 
         TextView btnSave = createDialogButton("Save", "#06101E", "#00F5A0");
         LinearLayout.LayoutParams saveParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         saveParams.setMargins(dpToPx(8), 0, 0, 0);
         btnSave.setLayoutParams(saveParams);
+        attachTouchBounceAnimation(btnSave);
         btnSave.setOnClickListener(v -> {
             SharedPreferences.Editor editor = sharedPrefs.edit();
             if (rbNone.isChecked()) {
@@ -4061,19 +4428,764 @@ public class HomeActivity extends AppCompatActivity {
             }
             editor.putBoolean("USE_BIOMETRIC", cbBio.isChecked());
             editor.apply();
-            dialog.dismiss();
+            dismissPopupWithAnimation(dialog, root, null);
         });
 
         btnRow.addView(btnCancel);
         btnRow.addView(btnSave);
         root.addView(btnRow);
 
-        dialog.show();
+        showAnimatedDialog(dialog, root);
+    }
+
+    // =========================================================================
+    // In-App Auto Update & Direct APK Installer + App Sharing System
+    // =========================================================================
+    private String getConfiguredGithubRepo() {
+        String saved = sharedPrefs.getString("UPDATE_GITHUB_REPO", "").trim();
+        if (!saved.isEmpty()) {
+            return normalizeGithubRepoInput(saved);
+        }
+        try {
+            int resId = getResources().getIdentifier("github_repo", "string", getPackageName());
+            if (resId != 0) {
+                String fromXml = getString(resId).trim();
+                if (!fromXml.isEmpty() && !fromXml.contains("${{")) {
+                    return normalizeGithubRepoInput(fromXml);
+                }
+            }
+        } catch (Exception ignored) {}
+        return "YasinAdnan/ProStrem";
+    }
+
+    private String normalizeGithubRepoInput(String raw) {
+        if (raw == null) return "";
+        String s = raw.trim();
+        if (s.startsWith("http://") || s.startsWith("https://")) {
+            if (s.toLowerCase(Locale.ROOT).endsWith(".apk")) {
+                return s;
+            }
+            try {
+                Uri u = Uri.parse(s);
+                List<String> segs = u.getPathSegments();
+                if (segs != null && segs.size() >= 2) {
+                    return segs.get(0) + "/" + segs.get(1).replace(".git", "");
+                }
+            } catch (Exception ignored) {}
+        }
+        return s.replaceAll("^/+|/+$", "");
+    }
+
+    private int getInstalledBuildNumber() {
+        int savedBuild = sharedPrefs.getInt("INSTALLED_BUILD_NUMBER_V6", -1);
+        int xmlBuild = 1;
+        try {
+            int resId = getResources().getIdentifier("build_number", "string", getPackageName());
+            if (resId != 0) {
+                String raw = getString(resId).trim();
+                Matcher m = Pattern.compile("(\\d+)").matcher(raw);
+                if (m.find() && m.group(1) != null) {
+                    xmlBuild = Integer.parseInt(m.group(1));
+                }
+            }
+        } catch (Exception ignored) {}
+        return Math.max(savedBuild, xmlBuild);
+    }
+
+    private String getInstalledVersionLabel() {
+        try {
+            int resId = getResources().getIdentifier("app_version", "string", getPackageName());
+            if (resId != 0) {
+                String v = getString(resId).trim();
+                if (!v.isEmpty() && !v.contains("${{")) {
+                    return v;
+                }
+            }
+        } catch (Exception ignored) {}
+        return "2.0." + getInstalledBuildNumber();
+    }
+
+    private void showInAppUpdateCenterDialog() {
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        final LinearLayout root = createStyledDialogCard();
+
+        TextView title = new TextView(this);
+        title.setText("🔄 ProStream In-App Updater");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(17f);
+        title.setTypeface(modernFont, Typeface.BOLD);
+        title.setPadding(0, 0, 0, dpToPx(6));
+        root.addView(title);
+
+        final TextView tvCurrentVer = new TextView(this);
+        tvCurrentVer.setText("Installed Version: v" + getInstalledVersionLabel() + " (Build #" + getInstalledBuildNumber() + ")");
+        tvCurrentVer.setTextColor(Color.parseColor("#94A3B8"));
+        tvCurrentVer.setTextSize(12f);
+        tvCurrentVer.setPadding(0, 0, 0, dpToPx(12));
+        root.addView(tvCurrentVer);
+
+        final LinearLayout statusCard = new LinearLayout(this);
+        statusCard.setOrientation(LinearLayout.VERTICAL);
+        statusCard.setPadding(dpToPx(14), dpToPx(12), dpToPx(14), dpToPx(12));
+        LinearLayout.LayoutParams scParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        scParams.setMargins(0, 0, 0, dpToPx(12));
+        statusCard.setLayoutParams(scParams);
+        GradientDrawable scBg = new GradientDrawable();
+        scBg.setCornerRadius(dpToPx(14));
+        scBg.setColor(Color.parseColor("#10141F"));
+        scBg.setStroke(dpToPx(1), Color.parseColor("#3300E5FF"));
+        statusCard.setBackground(scBg);
+
+        final TextView tvStatusTitle = new TextView(this);
+        tvStatusTitle.setText("🔍 Checking for updates...");
+        tvStatusTitle.setTextColor(Color.parseColor("#00E5FF"));
+        tvStatusTitle.setTextSize(13.5f);
+        tvStatusTitle.setTypeface(modernFont, Typeface.BOLD);
+        statusCard.addView(tvStatusTitle);
+
+        final TextView tvStatusNotes = new TextView(this);
+        tvStatusNotes.setText("Connecting to GitHub Release server...");
+        tvStatusNotes.setTextColor(Color.parseColor("#CBD5E1"));
+        tvStatusNotes.setTextSize(11.5f);
+        tvStatusNotes.setPadding(0, dpToPx(4), 0, 0);
+        statusCard.addView(tvStatusNotes);
+
+        root.addView(statusCard);
+
+        TextView repoLabel = new TextView(this);
+        repoLabel.setText("GitHub Repo (owner/repo) or Direct APK URL:");
+        repoLabel.setTextColor(Color.parseColor("#94A3B8"));
+        repoLabel.setTextSize(11f);
+        repoLabel.setPadding(0, 0, 0, dpToPx(4));
+        root.addView(repoLabel);
+
+        final EditText inputRepo = createStyledEditText("e.g. username/ProStrem or https://.../ProStream.apk", getConfiguredGithubRepo(), false);
+        root.addView(inputRepo);
+
+        builder.setView(root);
+        final AlertDialog dialog = builder.create();
+        if (dialog.getWindow() != null) {
+            dialog.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        }
+
+        final String[] latestDownloadUrlHolder = {""};
+        final int[] latestBuildNumHolder = {getInstalledBuildNumber()};
+
+        LinearLayout actionRow = new LinearLayout(this);
+        actionRow.setOrientation(LinearLayout.HORIZONTAL);
+        actionRow.setWeightSum(2f);
+        LinearLayout.LayoutParams arParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        arParams.setMargins(0, 0, 0, dpToPx(10));
+        actionRow.setLayoutParams(arParams);
+
+        final TextView btnCheckAgain = createDialogButton("🔍 Check Now", "#7DD3FC", "#13263B");
+        LinearLayout.LayoutParams p1 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        p1.setMargins(0, 0, dpToPx(5), 0);
+        btnCheckAgain.setLayoutParams(p1);
+        attachTouchBounceAnimation(btnCheckAgain);
+
+        final TextView btnInstallUpdate = createDialogButton("⚡ Update Now", "#06101E", "#00F5A0");
+        LinearLayout.LayoutParams p2 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        p2.setMargins(dpToPx(5), 0, 0, 0);
+        btnInstallUpdate.setLayoutParams(p2);
+        attachTouchBounceAnimation(btnInstallUpdate);
+
+        actionRow.addView(btnCheckAgain);
+        actionRow.addView(btnInstallUpdate);
+        root.addView(actionRow);
+
+        final Runnable triggerCheck = () -> {
+            String entered = normalizeGithubRepoInput(inputRepo.getText().toString());
+            if (!entered.isEmpty()) {
+                sharedPrefs.edit().putString("UPDATE_GITHUB_REPO", entered).apply();
+            }
+            final String targetRepoOrUrl = entered.isEmpty() ? getConfiguredGithubRepo() : entered;
+            tvStatusTitle.setText("🔍 Checking for updates...");
+            tvStatusTitle.setTextColor(Color.parseColor("#00E5FF"));
+            tvStatusNotes.setText("Source: " + targetRepoOrUrl);
+
+            bgExecutor.execute(() -> {
+                try {
+                    if (targetRepoOrUrl.startsWith("http") && targetRepoOrUrl.toLowerCase(Locale.ROOT).endsWith(".apk")) {
+                        latestDownloadUrlHolder[0] = targetRepoOrUrl;
+                        mainHandler.post(() -> {
+                            tvStatusTitle.setText("✓ Direct APK Link Ready");
+                            tvStatusTitle.setTextColor(Color.parseColor("#00F5A0"));
+                            tvStatusNotes.setText("Tap 'Update Now' to download and install the latest APK directly inside ProStream.");
+                        });
+                        return;
+                    }
+
+                    String apiUrl = "https://api.github.com/repos/" + targetRepoOrUrl + "/releases/latest";
+                    HttpURLConnection conn = openBrowserLikeConnectionWithRedirects(apiUrl, "https://github.com/" + targetRepoOrUrl, null);
+                    conn.setRequestProperty("Accept", "application/vnd.github+json");
+                    int code = conn.getResponseCode();
+
+                    if (code >= 200 && code < 300) {
+                        BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+                        StringBuilder sb = new StringBuilder();
+                        String line;
+                        while ((line = reader.readLine()) != null) {
+                            sb.append(line).append("\n");
+                        }
+                        reader.close();
+                        conn.disconnect();
+
+                        JSONObject releaseJson = new JSONObject(sb.toString());
+                        final String tagName = releaseJson.optString("tag_name", "latest");
+                        final String relTitle = releaseJson.optString("name", tagName);
+                        final String bodyNotes = releaseJson.optString("body", "Bug fixes and performance improvements.");
+                        String apkDownloadUrl = "https://github.com/" + targetRepoOrUrl + "/releases/latest/download/ProStream.apk";
+                        long apkSize = 0;
+
+                        JSONArray assets = releaseJson.optJSONArray("assets");
+                        if (assets != null) {
+                            for (int i = 0; i < assets.length(); i++) {
+                                JSONObject asset = assets.optJSONObject(i);
+                                if (asset != null) {
+                                    String bUrl = asset.optString("browser_download_url", "");
+                                    if (bUrl.toLowerCase(Locale.ROOT).endsWith(".apk")) {
+                                        apkDownloadUrl = bUrl;
+                                        apkSize = asset.optLong("size", 0);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        int remoteBuildNum = getInstalledBuildNumber();
+                        Matcher m = Pattern.compile("(\\d+)").matcher(tagName);
+                        if (m.find() && m.group(1) != null) {
+                            remoteBuildNum = Integer.parseInt(m.group(1));
+                        }
+
+                        latestDownloadUrlHolder[0] = apkDownloadUrl;
+                        latestBuildNumHolder[0] = remoteBuildNum;
+                        final int finalRemoteBuild = remoteBuildNum;
+                        final String sizeLabel = apkSize > 0 ? (" • " + formatBytesStatic(apkSize)) : "";
+
+                        mainHandler.post(() -> {
+                            if (finalRemoteBuild > getInstalledBuildNumber()) {
+                                tvStatusTitle.setText("🔥 New Update Available: " + relTitle + sizeLabel);
+                                tvStatusTitle.setTextColor(Color.parseColor("#00F5A0"));
+                                tvStatusNotes.setText(bodyNotes + "\n\nTap 'Update Now' to install directly.");
+                            } else {
+                                tvStatusTitle.setText("✓ You have the latest version (" + tagName + sizeLabel + ")");
+                                tvStatusTitle.setTextColor(Color.parseColor("#00F5A0"));
+                                tvStatusNotes.setText("You can still tap 'Update Now' anytime to reinstall or force-update from the latest GitHub release.");
+                            }
+                        });
+                    } else {
+                        conn.disconnect();
+                        latestDownloadUrlHolder[0] = "https://github.com/" + targetRepoOrUrl + "/releases/latest/download/ProStream.apk";
+                        mainHandler.post(() -> {
+                            tvStatusTitle.setText("ℹ️ Ready via Direct Release Link");
+                            tvStatusTitle.setTextColor(Color.parseColor("#FDE047"));
+                            tvStatusNotes.setText("Enter your GitHub repo (username/repo) above and tap 'Update Now' to fetch ProStream.apk.");
+                        });
+                    }
+                } catch (Exception e) {
+                    mainHandler.post(() -> {
+                        tvStatusTitle.setText("⚠️ Could not reach update server");
+                        tvStatusTitle.setTextColor(Color.parseColor("#FDA4AF"));
+                        tvStatusNotes.setText("Check your internet connection or verify your GitHub repo name above.");
+                    });
+                }
+            });
+        };
+
+        btnCheckAgain.setOnClickListener(v -> triggerCheck.run());
+
+        btnInstallUpdate.setOnClickListener(v -> {
+            String entered = normalizeGithubRepoInput(inputRepo.getText().toString());
+            if (!entered.isEmpty()) {
+                sharedPrefs.edit().putString("UPDATE_GITHUB_REPO", entered).apply();
+            }
+            String dlUrl = latestDownloadUrlHolder[0];
+            if (dlUrl == null || dlUrl.isEmpty()) {
+                if (entered.startsWith("http") && entered.toLowerCase(Locale.ROOT).endsWith(".apk")) {
+                    dlUrl = entered;
+                } else {
+                    String repo = entered.isEmpty() ? getConfiguredGithubRepo() : entered;
+                    dlUrl = "https://github.com/" + repo + "/releases/latest/download/ProStream.apk";
+                }
+            }
+            final String finalDlUrl = dlUrl;
+            final int targetBuild = latestBuildNumHolder[0];
+            dismissPopupWithAnimation(dialog, root, () -> downloadAndInstallApkInApp(finalDlUrl, targetBuild));
+        });
+
+        LinearLayout bottomRow = new LinearLayout(this);
+        bottomRow.setGravity(Gravity.END);
+        TextView btnClose = createDialogButton("Close", "#94A3B8", "#1E2230");
+        attachTouchBounceAnimation(btnClose);
+        btnClose.setOnClickListener(v -> dismissPopupWithAnimation(dialog, root, null));
+        bottomRow.addView(btnClose);
+        root.addView(bottomRow);
+
+        showAnimatedDialog(dialog, root);
+        triggerCheck.run();
+    }
+
+    private void checkForAppUpdateInBackground(final boolean showToastIfUpToDate) {
+        final String repoOrUrl = getConfiguredGithubRepo();
+        if (repoOrUrl.isEmpty() || repoOrUrl.equalsIgnoreCase("YasinAdnan/ProStrem")) {
+            return;
+        }
+        bgExecutor.execute(() -> {
+            try {
+                if (repoOrUrl.startsWith("http")) return;
+                String apiUrl = "https://api.github.com/repos/" + repoOrUrl + "/releases/latest";
+                HttpURLConnection conn = openBrowserLikeConnectionWithRedirects(apiUrl, "https://github.com/" + repoOrUrl, null);
+                conn.setRequestProperty("Accept", "application/vnd.github+json");
+                int code = conn.getResponseCode();
+                if (code < 200 || code >= 300) {
+                    conn.disconnect();
+                    return;
+                }
+                BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+                StringBuilder sb = new StringBuilder();
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    sb.append(line).append("\n");
+                }
+                reader.close();
+                conn.disconnect();
+
+                JSONObject releaseJson = new JSONObject(sb.toString());
+                final String tagName = releaseJson.optString("tag_name", "");
+                final String relTitle = releaseJson.optString("name", tagName);
+                final String bodyNotes = releaseJson.optString("body", "New update available!");
+                String apkUrl = "https://github.com/" + repoOrUrl + "/releases/latest/download/ProStream.apk";
+
+                JSONArray assets = releaseJson.optJSONArray("assets");
+                if (assets != null) {
+                    for (int i = 0; i < assets.length(); i++) {
+                        JSONObject asset = assets.optJSONObject(i);
+                        if (asset != null) {
+                            String bUrl = asset.optString("browser_download_url", "");
+                            if (bUrl.toLowerCase(Locale.ROOT).endsWith(".apk")) {
+                                apkUrl = bUrl;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                int remoteBuild = -1;
+                Matcher m = Pattern.compile("(\\d+)").matcher(tagName);
+                if (m.find() && m.group(1) != null) {
+                    remoteBuild = Integer.parseInt(m.group(1));
+                }
+
+                if (remoteBuild > getInstalledBuildNumber()) {
+                    final String finalApkUrl = apkUrl;
+                    final int finalRemoteBuild = remoteBuild;
+                    mainHandler.post(() -> {
+                        if (!isFinishing()) {
+                            showNewUpdatePromptDialog(relTitle, tagName, bodyNotes, finalApkUrl, finalRemoteBuild);
+                        }
+                    });
+                } else if (showToastIfUpToDate) {
+                    mainHandler.post(() -> Toast.makeText(HomeActivity.this, "ProStream is up to date!", Toast.LENGTH_SHORT).show());
+                }
+            } catch (Exception ignored) {}
+        });
+    }
+
+    private void showNewUpdatePromptDialog(String relTitle, String tagName, String notes, final String apkUrl, final int newBuildNum) {
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        final LinearLayout root = createStyledDialogCard();
+
+        TextView title = new TextView(this);
+        title.setText("🚀 Update Available!");
+        title.setTextColor(Color.parseColor("#00F5A0"));
+        title.setTextSize(17f);
+        title.setTypeface(modernFont, Typeface.BOLD);
+        title.setPadding(0, 0, 0, dpToPx(6));
+        root.addView(title);
+
+        TextView sub = new TextView(this);
+        sub.setText(relTitle + " (" + tagName + ")\n\n" + notes);
+        sub.setTextColor(Color.parseColor("#E2E8F0"));
+        sub.setTextSize(12.5f);
+        sub.setPadding(0, 0, 0, dpToPx(14));
+        root.addView(sub);
+
+        builder.setView(root);
+        final AlertDialog dialog = builder.create();
+        if (dialog.getWindow() != null) {
+            dialog.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        }
+
+        LinearLayout btnRow = new LinearLayout(this);
+        btnRow.setOrientation(LinearLayout.HORIZONTAL);
+        btnRow.setGravity(Gravity.END);
+
+        TextView btnLater = createDialogButton("Later", "#94A3B8", "#1E2230");
+        attachTouchBounceAnimation(btnLater);
+        btnLater.setOnClickListener(v -> dismissPopupWithAnimation(dialog, root, null));
+
+        TextView btnUpdateNow = createDialogButton("⚡ Update Now", "#06101E", "#00F5A0");
+        LinearLayout.LayoutParams upParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        upParams.setMargins(dpToPx(8), 0, 0, 0);
+        btnUpdateNow.setLayoutParams(upParams);
+        attachTouchBounceAnimation(btnUpdateNow);
+        btnUpdateNow.setOnClickListener(v -> {
+            dismissPopupWithAnimation(dialog, root, () -> downloadAndInstallApkInApp(apkUrl, newBuildNum));
+        });
+
+        btnRow.addView(btnLater);
+        btnRow.addView(btnUpdateNow);
+        root.addView(btnRow);
+
+        showAnimatedDialog(dialog, root);
+    }
+
+    private void downloadAndInstallApkInApp(final String apkUrl, final int targetBuildNum) {
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        final LinearLayout root = createStyledDialogCard();
+
+        TextView title = new TextView(this);
+        title.setText("⚡ Updating ProStream...");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(16.5f);
+        title.setTypeface(modernFont, Typeface.BOLD);
+        title.setPadding(0, 0, 0, dpToPx(8));
+        root.addView(title);
+
+        final TextView tvProgInfo = new TextView(this);
+        tvProgInfo.setText("Connecting to server...");
+        tvProgInfo.setTextColor(Color.parseColor("#00E5FF"));
+        tvProgInfo.setTextSize(12f);
+        tvProgInfo.setPadding(0, 0, 0, dpToPx(8));
+        root.addView(tvProgInfo);
+
+        final ProgressBar pb = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        pb.setMax(100);
+        pb.setProgress(2);
+        LinearLayout.LayoutParams pbParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dpToPx(8));
+        pbParams.setMargins(0, 0, 0, dpToPx(14));
+        pb.setLayoutParams(pbParams);
+        root.addView(pb);
+
+        final boolean[] cancelled = {false};
+
+        builder.setView(root);
+        final AlertDialog progDialog = builder.create();
+        progDialog.setCancelable(false);
+        if (progDialog.getWindow() != null) {
+            progDialog.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        }
+
+        LinearLayout bottomRow = new LinearLayout(this);
+        bottomRow.setGravity(Gravity.END);
+        TextView btnCancel = createDialogButton("Cancel", "#FDA4AF", "#3B1824");
+        attachTouchBounceAnimation(btnCancel);
+        btnCancel.setOnClickListener(v -> {
+            cancelled[0] = true;
+            dismissPopupWithAnimation(progDialog, root, null);
+        });
+        bottomRow.addView(btnCancel);
+        root.addView(bottomRow);
+
+        showAnimatedDialog(progDialog, root);
+
+        customDlExecutor.execute(() -> {
+            HttpURLConnection conn = null;
+            InputStream in = null;
+            FileOutputStream fos = null;
+            final File apkFile = getSafeWritableDownloadFile("ProStream_Update.apk");
+            if (apkFile.exists()) {
+                apkFile.delete();
+            }
+
+            try {
+                conn = openBrowserLikeConnectionWithRedirects(apkUrl, apkUrl, null);
+                int code = conn.getResponseCode();
+                if (code < 200 || code >= 400) {
+                    throw new Exception("HTTP " + code);
+                }
+
+                long totalLen = Build.VERSION.SDK_INT >= Build.VERSION_CODES.N ? conn.getContentLengthLong() : conn.getContentLength();
+                in = new BufferedInputStream(conn.getInputStream(), 128 * 1024);
+                fos = new FileOutputStream(apkFile);
+
+                byte[] buf = new byte[64 * 1024];
+                long downloaded = 0;
+                long lastTick = System.currentTimeMillis();
+                long lastBytes = 0;
+                long speedBps = 0;
+                int r;
+
+                while ((r = in.read(buf)) != -1) {
+                    if (cancelled[0]) {
+                        fos.close();
+                        in.close();
+                        apkFile.delete();
+                        return;
+                    }
+                    fos.write(buf, 0, r);
+                    downloaded += r;
+
+                    long now = System.currentTimeMillis();
+                    if (now - lastTick >= 350) {
+                        speedBps = ((downloaded - lastBytes) * 1000L) / Math.max(1L, now - lastTick);
+                        lastTick = now;
+                        lastBytes = downloaded;
+
+                        final int pct = totalLen > 0 ? (int) Math.min(99L, (downloaded * 100L) / totalLen) : 50;
+                        final String lineText = pct + "%  •  " + formatBytesStatic(downloaded)
+                                + (totalLen > 0 ? (" / " + formatBytesStatic(totalLen)) : "")
+                                + "  •  " + formatSpeedStatic(speedBps);
+                        mainHandler.post(() -> {
+                            pb.setProgress(Math.max(4, pct));
+                            tvProgInfo.setText(lineText);
+                        });
+                    }
+                }
+                fos.flush();
+                fos.close();
+                fos = null;
+                in.close();
+                in = null;
+
+                if (apkFile.length() < 100 * 1024) {
+                    apkFile.delete();
+                    throw new Exception("Downloaded file is not a valid APK");
+                }
+
+                if (targetBuildNum > getInstalledBuildNumber()) {
+                    sharedPrefs.edit().putInt("INSTALLED_BUILD_NUMBER_V6", targetBuildNum).apply();
+                }
+
+                mainHandler.post(() -> {
+                    dismissPopupWithAnimation(progDialog, root, () -> installDownloadedUpdateApk(apkFile));
+                });
+            } catch (Exception e) {
+                mainHandler.post(() -> {
+                    if (progDialog.isShowing()) {
+                        progDialog.dismiss();
+                    }
+                    Toast.makeText(HomeActivity.this, "Update download failed. Check repo/link in Update settings.", Toast.LENGTH_LONG).show();
+                });
+            } finally {
+                try { if (fos != null) fos.close(); } catch (Exception ignored) {}
+                try { if (in != null) in.close(); } catch (Exception ignored) {}
+                if (conn != null) conn.disconnect();
+            }
+        });
+    }
+
+    private void installDownloadedUpdateApk(File apkFile) {
+        if (apkFile == null || !apkFile.exists()) return;
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                if (!getPackageManager().canRequestPackageInstalls()) {
+                    pendingUpdateApkFile = apkFile;
+                    Toast.makeText(this, "Allow 'Install unknown apps' to finish updating ProStream", Toast.LENGTH_LONG).show();
+                    launchingInternalActivity = true;
+                    Intent permIntent = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + getPackageName()));
+                    startActivity(permIntent);
+                    return;
+                }
+            }
+
+            // Android 10+ MediaStore content:// URI দিয়ে ১০০% ক্র্যাশহীনভাবে সিস্টেম প্যাকেজ ইনস্টলার ওপেন করা
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ContentResolver resolver = getApplicationContext().getContentResolver();
+                ContentValues values = new ContentValues();
+                String exportName = "ProStream_Update_" + (System.currentTimeMillis() % 10000) + ".apk";
+                values.put(MediaStore.Downloads.DISPLAY_NAME, exportName);
+                values.put(MediaStore.Downloads.MIME_TYPE, "application/vnd.android.package-archive");
+                values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/ProStream");
+                values.put(MediaStore.Downloads.IS_PENDING, 1);
+
+                Uri collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
+                Uri apkContentUri = resolver.insert(collection, values);
+                if (apkContentUri != null) {
+                    OutputStream os = resolver.openOutputStream(apkContentUri);
+                    FileInputStream fis = new FileInputStream(apkFile);
+                    if (os != null) {
+                        byte[] buf = new byte[128 * 1024];
+                        int r;
+                        while ((r = fis.read(buf)) != -1) {
+                            os.write(buf, 0, r);
+                        }
+                        os.flush();
+                        os.close();
+                    }
+                    fis.close();
+
+                    ContentValues done = new ContentValues();
+                    done.put(MediaStore.Downloads.IS_PENDING, 0);
+                    resolver.update(apkContentUri, done, null, null);
+
+                    launchingInternalActivity = true;
+                    Intent installIntent = new Intent(Intent.ACTION_VIEW);
+                    installIntent.setDataAndType(apkContentUri, "application/vnd.android.package-archive");
+                    installIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+                    startActivity(installIntent);
+                    return;
+                }
+            }
+
+            // PackageInstaller Session fallback for Android 7-9
+            PackageInstaller packageInstaller = getPackageManager().getPackageInstaller();
+            PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(
+                    PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+            params.setAppPackageName(getPackageName());
+            int sessionId = packageInstaller.createSession(params);
+            PackageInstaller.Session session = packageInstaller.openSession(sessionId);
+
+            OutputStream out = session.openWrite("ProStream_Update", 0, apkFile.length());
+            FileInputStream fis = new FileInputStream(apkFile);
+            byte[] buffer = new byte[64 * 1024];
+            int c;
+            while ((c = fis.read(buffer)) != -1) {
+                out.write(buffer, 0, c);
+            }
+            session.fsync(out);
+            fis.close();
+            out.close();
+
+            Intent callbackIntent = new Intent(this, HomeActivity.class);
+            int flags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                    ? (PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_MUTABLE)
+                    : PendingIntent.FLAG_UPDATE_CURRENT;
+            PendingIntent pi = PendingIntent.getActivity(this, sessionId, callbackIntent, flags);
+            session.commit(pi.getIntentSender());
+            session.close();
+        } catch (Exception e) {
+            Toast.makeText(this, "Update APK saved in Downloads/ProStream folder. Tap to install.", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void showShareProStreamDialog() {
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        final LinearLayout root = createStyledDialogCard();
+
+        TextView title = new TextView(this);
+        title.setText("📤 Share ProStream");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(17f);
+        title.setTypeface(modernFont, Typeface.BOLD);
+        title.setPadding(0, 0, 0, dpToPx(10));
+        root.addView(title);
+
+        builder.setView(root);
+        final AlertDialog dialog = builder.create();
+        if (dialog.getWindow() != null) {
+            dialog.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        }
+
+        final String repo = getConfiguredGithubRepo();
+        final String ghReleaseLink = repo.startsWith("http")
+                ? repo
+                : ("https://github.com/" + repo + "/releases/latest/download/ProStream.apk");
+        String[] parts = repo.split("/");
+        final String landingUrl = (parts.length == 2)
+                ? ("https://" + parts[0].toLowerCase(Locale.ROOT) + ".github.io/" + parts[1] + "/")
+                : ghReleaseLink;
+
+        root.addView(createCompactSettingRow("🌐  Share Landing Page & Link", "Share Link", "#00F5A0", v -> {
+            dismissPopupWithAnimation(dialog, root, () -> {
+                try {
+                    String shareMsg = "⚡ ProStream — High-Speed Streaming Browser & 4x Turbo Video Downloader!\n\n"
+                            + "🌐 Official Page & Tutorial:\n" + landingUrl + "\n\n"
+                            + "📥 Direct APK Download:\n" + ghReleaseLink + "\n\n"
+                            + "✈️ Support: " + TELEGRAM_BOT_URL;
+                    launchingInternalActivity = true;
+                    Intent sendIntent = new Intent(Intent.ACTION_SEND);
+                    sendIntent.setType("text/plain");
+                    sendIntent.putExtra(Intent.EXTRA_SUBJECT, "ProStream Android App");
+                    sendIntent.putExtra(Intent.EXTRA_TEXT, shareMsg);
+                    startActivity(Intent.createChooser(sendIntent, "Share ProStream Link"));
+                } catch (Exception ignored) {}
+            });
+        }));
+
+        root.addView(createCompactSettingRow("📦  Send Installed APK File", "Direct APK", "#00E5FF", v -> {
+            dismissPopupWithAnimation(dialog, root, this::shareInstalledApkFileDirectly);
+        }));
+
+        LinearLayout bottomRow = new LinearLayout(this);
+        bottomRow.setGravity(Gravity.END);
+        bottomRow.setPadding(0, dpToPx(8), 0, 0);
+        TextView btnClose = createDialogButton("Close", "#94A3B8", "#1E2230");
+        attachTouchBounceAnimation(btnClose);
+        btnClose.setOnClickListener(v -> dismissPopupWithAnimation(dialog, root, null));
+        bottomRow.addView(btnClose);
+        root.addView(bottomRow);
+
+        showAnimatedDialog(dialog, root);
+    }
+
+    private void shareInstalledApkFileDirectly() {
+        bgExecutor.execute(() -> {
+            try {
+                String sourceApkPath = getApplicationInfo().sourceDir;
+                File srcFile = new File(sourceApkPath);
+                if (!srcFile.exists()) return;
+
+                String exportedUri = "";
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    ContentResolver resolver = getApplicationContext().getContentResolver();
+                    ContentValues values = new ContentValues();
+                    values.put(MediaStore.Downloads.DISPLAY_NAME, "ProStream_Share_" + (System.currentTimeMillis() % 10000) + ".apk");
+                    values.put(MediaStore.Downloads.MIME_TYPE, "application/vnd.android.package-archive");
+                    values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/ProStream");
+                    values.put(MediaStore.Downloads.IS_PENDING, 1);
+
+                    Uri collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
+                    Uri itemUri = resolver.insert(collection, values);
+                    if (itemUri != null) {
+                        OutputStream os = resolver.openOutputStream(itemUri);
+                        FileInputStream fis = new FileInputStream(srcFile);
+                        if (os != null) {
+                            byte[] buf = new byte[128 * 1024];
+                            int r;
+                            while ((r = fis.read(buf)) != -1) {
+                                os.write(buf, 0, r);
+                            }
+                            os.flush();
+                            os.close();
+                        }
+                        fis.close();
+
+                        ContentValues done = new ContentValues();
+                        done.put(MediaStore.Downloads.IS_PENDING, 0);
+                        resolver.update(itemUri, done, null, null);
+                        exportedUri = itemUri.toString();
+                    }
+                }
+
+                final String finalUriStr = exportedUri;
+                mainHandler.post(() -> {
+                    try {
+                        if (!finalUriStr.isEmpty()) {
+                            launchingInternalActivity = true;
+                            Intent shareIntent = new Intent(Intent.ACTION_SEND);
+                            shareIntent.setType("application/vnd.android.package-archive");
+                            shareIntent.putExtra(Intent.EXTRA_STREAM, Uri.parse(finalUriStr));
+                            shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                            startActivity(Intent.createChooser(shareIntent, "Send ProStream.apk"));
+                        } else {
+                            Toast.makeText(HomeActivity.this, "Use 'Share Landing Page & Link' on this Android version", Toast.LENGTH_SHORT).show();
+                        }
+                    } catch (Exception ignored) {}
+                });
+            } catch (Exception ignored) {}
+        });
     }
 
     private void showAllSettingsDialog() {
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
-        LinearLayout root = createStyledDialogCard();
+        final LinearLayout root = createStyledDialogCard();
 
         TextView title = new TextView(this);
         title.setText("Settings");
@@ -4096,75 +5208,82 @@ public class HomeActivity extends AppCompatActivity {
             dialog.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
         }
 
+        list.addView(createCompactSettingRow("🔄  App Update (In-App)", "v" + getInstalledVersionLabel(), "#00F5A0", v -> {
+            dismissPopupWithAnimation(dialog, root, this::showInAppUpdateCenterDialog);
+        }));
+
+        list.addView(createCompactSettingRow("📤  Share ProStream App", "Link / APK", "#38BDF8", v -> {
+            dismissPopupWithAnimation(dialog, root, this::showShareProStreamDialog);
+        }));
+
         list.addView(createCompactSettingRow("📥  Video Downloader", "Open", "#00E5FF", v -> {
-            dialog.dismiss();
-            showUniversalLinkDownloaderDialog("");
+            dismissPopupWithAnimation(dialog, root, () -> showUniversalLinkDownloaderDialog(""));
         }));
 
         list.addView(createCompactSettingRow("🎞️  Downloads", "View", "#F9A8D4", v -> {
-            dialog.dismiss();
-            showMediaDownloadsDialog();
+            dismissPopupWithAnimation(dialog, root, this::showMediaDownloadsDialog);
         }));
 
         list.addView(createCompactSettingRow("🔋  Battery Saver", batterySaverEnabled ? "ON" : "OFF", batterySaverEnabled ? "#00F5A0" : "#94A3B8", v -> {
-            dialog.dismiss();
-            showBatterySaverDialog();
+            dismissPopupWithAnimation(dialog, root, this::showBatterySaverDialog);
         }));
 
         list.addView(createCompactSettingRow("⚡  AdBlock DNS", "Setup", "#7DD3FC", v -> {
-            dialog.dismiss();
-            showPrivateDnsSetupDialog();
+            dismissPopupWithAnimation(dialog, root, this::showPrivateDnsSetupDialog);
         }));
 
         list.addView(createCompactSettingRow("🌙  Dark Mode", darkModeEnabled ? "ON" : "OFF", darkModeEnabled ? "#FDE047" : "#94A3B8", v -> {
-            dialog.dismiss();
             darkModeEnabled = !darkModeEnabled;
             sharedPrefs.edit().putBoolean("DARK_MODE", darkModeEnabled).apply();
             for (WebView wv : webViewPool.values()) {
                 applyWebViewDarkMode(wv, darkModeEnabled);
             }
+            dismissPopupWithAnimation(dialog, root, null);
+        }));
+
+        list.addView(createCompactSettingRow("🎨  Theme & Accent Color", "Customize", "#38BDF8", v -> {
+            dismissPopupWithAnimation(dialog, root, () -> {
+                launchingInternalActivity = true;
+                startActivity(new Intent(HomeActivity.this, InterfaceActivity.class));
+            });
         }));
 
         list.addView(createCompactSettingRow("🔗  Manage Sites", String.valueOf(siteList.size()), "#6EE7B7", v -> {
-            dialog.dismiss();
-            showSiteManagerDialog();
+            dismissPopupWithAnimation(dialog, root, this::showSiteManagerDialog);
         }));
 
         int lockType = sharedPrefs.getInt("LOCK_TYPE", 1);
         list.addView(createCompactSettingRow("🛡️  App Lock", lockType == 0 ? "OFF" : "PIN", "#C4B5FD", v -> {
-            dialog.dismiss();
-            showAppLockDialog();
+            dismissPopupWithAnimation(dialog, root, this::showAppLockDialog);
         }));
 
         list.addView(createCompactSettingRow("🔓  App Permissions", "Grant", "#00F5A0", v -> {
-            dialog.dismiss();
-            requestAllMobileAndChromePermissions(true);
+            dismissPopupWithAnimation(dialog, root, () -> requestAllMobileAndChromePermissions(true));
         }));
 
         list.addView(createCompactSettingRow("🗑️  Clear Cache", getFormattedCacheSize(), "#FDA4AF", v -> {
-            dialog.dismiss();
-            clearAppCacheNow();
+            dismissPopupWithAnimation(dialog, root, this::clearAppCacheNow);
         }));
 
         list.addView(createCompactSettingRow("✈️  Telegram Support", "@contactyasinbot", "#00F5A0", v -> {
-            dialog.dismiss();
-            openUrlSafely(TELEGRAM_BOT_URL);
+            dismissPopupWithAnimation(dialog, root, () -> openUrlSafely(TELEGRAM_BOT_URL));
         }));
 
         LinearLayout bottomRow = new LinearLayout(this);
         bottomRow.setGravity(Gravity.END);
         bottomRow.setPadding(0, dpToPx(8), 0, 0);
         TextView btnClose = createDialogButton("Close", "#94A3B8", "#1E2230");
-        btnClose.setOnClickListener(v -> dialog.dismiss());
+        attachTouchBounceAnimation(btnClose);
+        btnClose.setOnClickListener(v -> dismissPopupWithAnimation(dialog, root, null));
         bottomRow.addView(btnClose);
         root.addView(bottomRow);
 
-        dialog.show();
+        showAnimatedDialog(dialog, root);
     }
 
     private void showBatterySaverDialog() {
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
-        LinearLayout root = createStyledDialogCard();
+        final LinearLayout root = createStyledDialogCard();
 
         TextView title = new TextView(this);
         title.setText("Battery Saver");
@@ -4227,34 +5346,37 @@ public class HomeActivity extends AppCompatActivity {
                 isUnrestricted ? "Allowed" : "Allow",
                 isUnrestricted ? "#00F5A0" : "#7DD3FC",
                 v -> {
-                    dialog.dismiss();
-                    try {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-                            if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
-                                Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
-                                intent.setData(Uri.parse("package:" + getPackageName()));
-                                startActivity(intent);
+                    dismissPopupWithAnimation(dialog, root, () -> {
+                        try {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                                PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                                if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
+                                    launchingInternalActivity = true;
+                                    Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                                    intent.setData(Uri.parse("package:" + getPackageName()));
+                                    startActivity(intent);
+                                }
                             }
-                        }
-                    } catch (Exception ignored) {}
+                        } catch (Exception ignored) {}
+                    });
                 }));
 
         LinearLayout bottomRow = new LinearLayout(this);
         bottomRow.setGravity(Gravity.END);
         bottomRow.setPadding(0, dpToPx(8), 0, 0);
         TextView btnClose = createDialogButton("Done", "#06101E", "#00F5A0");
-        btnClose.setOnClickListener(v -> dialog.dismiss());
+        attachTouchBounceAnimation(btnClose);
+        btnClose.setOnClickListener(v -> dismissPopupWithAnimation(dialog, root, null));
         bottomRow.addView(btnClose);
         root.addView(bottomRow);
 
-        dialog.show();
+        showAnimatedDialog(dialog, root);
     }
 
     private void showPrivateDnsSetupDialog() {
         final String dnsHost = "p2.freedns.controld.com";
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
-        LinearLayout root = createStyledDialogCard();
+        final LinearLayout root = createStyledDialogCard();
 
         TextView title = new TextView(this);
         title.setText("AdBlock Private DNS");
@@ -4293,29 +5415,33 @@ public class HomeActivity extends AppCompatActivity {
         bottomRow.setGravity(Gravity.END);
 
         TextView btnClose = createDialogButton("Close", "#94A3B8", "#1E2230");
-        btnClose.setOnClickListener(v -> dialog.dismiss());
+        attachTouchBounceAnimation(btnClose);
+        btnClose.setOnClickListener(v -> dismissPopupWithAnimation(dialog, root, null));
 
         TextView btnCopyDns = createDialogButton("Copy & Open Settings", "#06101E", "#00F5A0");
         LinearLayout.LayoutParams copyParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         copyParams.setMargins(dpToPx(8), 0, 0, 0);
         btnCopyDns.setLayoutParams(copyParams);
+        attachTouchBounceAnimation(btnCopyDns);
         btnCopyDns.setOnClickListener(v -> {
-            dialog.dismiss();
-            try {
-                ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-                ClipData clip = ClipData.newPlainText("Private DNS", dnsHost);
-                if (clipboard != null) clipboard.setPrimaryClip(clip);
-                Toast.makeText(this, "Copied: " + dnsHost, Toast.LENGTH_SHORT).show();
-                startActivity(new Intent(Settings.ACTION_SETTINGS));
-            } catch (Exception ignored) {}
+            dismissPopupWithAnimation(dialog, root, () -> {
+                try {
+                    ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                    ClipData clip = ClipData.newPlainText("Private DNS", dnsHost);
+                    if (clipboard != null) clipboard.setPrimaryClip(clip);
+                    Toast.makeText(this, "Copied: " + dnsHost, Toast.LENGTH_SHORT).show();
+                    launchingInternalActivity = true;
+                    startActivity(new Intent(Settings.ACTION_SETTINGS));
+                } catch (Exception ignored) {}
+            });
         });
 
         bottomRow.addView(btnClose);
         bottomRow.addView(btnCopyDns);
         root.addView(bottomRow);
 
-        dialog.show();
+        showAnimatedDialog(dialog, root);
     }
 
     private String getFormattedCacheSize() {
@@ -4343,16 +5469,12 @@ public class HomeActivity extends AppCompatActivity {
 
     private void clearAppCacheNow() {
         try {
-            if (webView != null && webView.getUrl() != null) {
-                saveCookiesToVault(webView.getUrl());
-            }
             for (WebView wv : webViewPool.values()) {
                 wv.clearCache(true);
             }
-            restoreCookiesFromVault();
             CookieManager.getInstance().flush();
             reloadActivePageCleanly();
-            Toast.makeText(this, "Cache cleared", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "Cache cleared (Cookies & OG icons preserved)", Toast.LENGTH_SHORT).show();
         } catch (Exception e) {
             Toast.makeText(this, "Cache cleared", Toast.LENGTH_SHORT).show();
         }
@@ -4360,6 +5482,7 @@ public class HomeActivity extends AppCompatActivity {
 
     private void openUrlSafely(String url) {
         try {
+            launchingInternalActivity = true;
             Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
             startActivity(intent);
         } catch (Exception e) {
@@ -4378,7 +5501,6 @@ public class HomeActivity extends AppCompatActivity {
                 o.put("url", s.url);
                 o.put("color", s.color);
                 o.put("ogImage", s.ogImage != null ? s.ogImage : "");
-                o.put("lastVisitedUrl", s.lastVisitedUrl != null ? s.lastVisitedUrl : "");
                 arr.put(o);
             }
             sharedPrefs.edit().putString("SITES_JSON", arr.toString()).apply();
@@ -4461,6 +5583,7 @@ public class HomeActivity extends AppCompatActivity {
 
         item.addView(t);
         item.addView(badge);
+        attachTouchBounceAnimation(item);
         item.setOnClickListener(listener);
         return item;
     }
@@ -4481,24 +5604,63 @@ public class HomeActivity extends AppCompatActivity {
     }
 
     @Override
+    protected void onUserLeaveHint() {
+        super.onUserLeaveHint();
+        if (!launchingInternalActivity) {
+            leftAppToBackground = true;
+        }
+    }
+
+    private void resetAllWebViewsToSiteHome() {
+        liveDetectedStreamsMap.clear();
+        for (SiteItem s : siteList) {
+            WebView wv = webViewPool.get(s.url);
+            if (wv != null) {
+                try {
+                    wv.stopLoading();
+                    wv.evaluateJavascript("(function(){var m=document.querySelectorAll('video,audio');for(var i=0;i<m.length;i++){try{m[i].pause();m[i].src='';}catch(e){}}})();", null);
+                    String currentUrl = wv.getUrl();
+                    if (currentUrl != null && !isRootHomepageUrl(currentUrl, s.url)) {
+                        clearHistoryOnLoadSet.add(wv);
+                        wv.loadUrl(s.url);
+                    }
+                } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    @Override
     protected void onResume() {
         super.onResume();
+        forceEnableAnimations();
         sessionAlive = true;
+        launchingInternalActivity = false;
+        leftAppToBackground = false;
+        if (pendingUpdateApkFile != null && pendingUpdateApkFile.exists()) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || getPackageManager().canRequestPackageInstalls()) {
+                File toInstall = pendingUpdateApkFile;
+                pendingUpdateApkFile = null;
+                installDownloadedUpdateApk(toInstall);
+            }
+        }
         darkModeEnabled = sharedPrefs.getBoolean("DARK_MODE", false);
         batterySaverEnabled = sharedPrefs.getBoolean("BATTERY_SAVER", true);
-        restoreCookiesFromVault();
         if (webView != null) {
             webView.onResume();
             webView.resumeTimers();
         }
+        startFloatingHubBreathingAnimation();
         startNotificationProgressTrackerStatic(appContextRef);
         applyDynamicTheme();
     }
 
     @Override
     protected void onPause() {
-        if (webView != null && webView.getUrl() != null) {
-            saveCookiesToVault(webView.getUrl());
+        exitCustomFullscreen();
+        if (webView != null) {
+            try {
+                webView.evaluateJavascript("(function(){var m=document.querySelectorAll('video,audio');for(var i=0;i<m.length;i++){try{m[i].pause();}catch(e){}}})();", null);
+            } catch (Exception ignored) {}
         }
         saveSitesToPrefs();
         boolean hasActiveDl = updateLiveDownloadNotificationsAndSpeedStatic(appContextRef);
@@ -4510,16 +5672,27 @@ public class HomeActivity extends AppCompatActivity {
     }
 
     @Override
+    protected void onStop() {
+        super.onStop();
+        if (!isChangingConfigurations() && (leftAppToBackground || !launchingInternalActivity)) {
+            resetAllWebViewsToSiteHome();
+        }
+        CookieManager.getInstance().flush();
+    }
+
+    @Override
     protected void onDestroy() {
         sessionAlive = false;
+        sessionUnlocked = false;
         stopPopupAnimators();
+        for (ValueAnimator a : hubIdleAnimators) {
+            try { a.cancel(); } catch (Exception ignored) {}
+        }
+        hubIdleAnimators.clear();
         if (mediaLiveRefreshRunnable != null) {
             mainHandler.removeCallbacks(mediaLiveRefreshRunnable);
         }
 
-        if (webView != null && webView.getUrl() != null) {
-            saveCookiesToVault(webView.getUrl());
-        }
         saveSitesToPrefs();
 
         boolean hasActiveDl = updateLiveDownloadNotificationsAndSpeedStatic(appContextRef);
@@ -4535,17 +5708,14 @@ public class HomeActivity extends AppCompatActivity {
 
         try {
             CookieManager.getInstance().flush();
-            if (!hasActiveDl) {
-                for (WebView wv : webViewPool.values()) {
-                    if (wv != null) {
-                        wv.stopLoading();
-                        wv.destroy();
-                    }
+            for (WebView wv : webViewPool.values()) {
+                if (wv != null) {
+                    wv.stopLoading();
+                    wv.destroy();
                 }
-                webViewPool.clear();
             }
+            webViewPool.clear();
         } catch (Exception ignored) {}
-        bgExecutor.shutdownNow();
         super.onDestroy();
     }
 
@@ -4554,6 +5724,17 @@ public class HomeActivity extends AppCompatActivity {
         window.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
         window.setStatusBarColor(Color.parseColor("#080B12"));
         window.setNavigationBarColor(Color.parseColor("#080B12"));
+
+        int customAccent = parseColorSafe(sharedPrefs.getString("APP_COLOR", "#00F5A0"), Color.parseColor("#00F5A0"));
+        if (btnFloatingHub != null) {
+            btnFloatingHub.setStrokeColor(customAccent);
+        }
+        if (tvHubBadge != null) {
+            tvHubBadge.setTextColor(customAccent);
+        }
+        if (progressBar != null) {
+            progressBar.setIndicatorColor(customAccent);
+        }
 
         if (currentSite != null) {
             updateUIForCurrentSite();
@@ -4564,6 +5745,7 @@ public class HomeActivity extends AppCompatActivity {
         siteList.clear();
         String json = sharedPrefs.getString("SITES_JSON", "");
         boolean migratedSingleSite = sharedPrefs.getBoolean("SINGLE_PRMOVIES_DEFAULT_V3", false);
+        boolean cleanedSubpageOg = sharedPrefs.getBoolean("OG_CLEAN_ROOT_V6", false);
 
         if (json.isEmpty() || !migratedSingleSite) {
             ArrayList<SiteItem> keptCustomSites = new ArrayList<>();
@@ -4579,8 +5761,7 @@ public class HomeActivity extends AppCompatActivity {
                                     o.optString("name", "Site"),
                                     u,
                                     o.optString("color", "#00F5A0"),
-                                    o.optString("ogImage", ""));
-                            item.lastVisitedUrl = o.optString("lastVisitedUrl", "");
+                                    "");
                             keptCustomSites.add(item);
                         }
                     }
@@ -4590,17 +5771,23 @@ public class HomeActivity extends AppCompatActivity {
             siteList.add(new SiteItem("Prmovies", DEFAULT_PRMOVIES_URL, "#00F5A0", ""));
             siteList.addAll(keptCustomSites);
             saveSitesToPrefs();
-            sharedPrefs.edit().putBoolean("SINGLE_PRMOVIES_DEFAULT_V3", true).apply();
+            sharedPrefs.edit()
+                    .putBoolean("SINGLE_PRMOVIES_DEFAULT_V3", true)
+                    .putBoolean("OG_CLEAN_ROOT_V6", true)
+                    .apply();
         } else {
             try {
                 JSONArray array = new JSONArray(json);
                 for (int i = 0; i < array.length(); i++) {
                     JSONObject obj = array.getJSONObject(i);
                     String siteColor = obj.optString("color", "#00F5A0");
-                    String ogImg = obj.optString("ogImage", "");
+                    String ogImg = cleanedSubpageOg ? obj.optString("ogImage", "") : "";
                     SiteItem item = new SiteItem(obj.getString("name"), obj.getString("url"), siteColor, ogImg);
-                    item.lastVisitedUrl = obj.optString("lastVisitedUrl", "");
                     siteList.add(item);
+                }
+                if (!cleanedSubpageOg) {
+                    sharedPrefs.edit().putBoolean("OG_CLEAN_ROOT_V6", true).apply();
+                    saveSitesToPrefs();
                 }
             } catch (Exception ignored) {}
         }
@@ -4610,15 +5797,19 @@ public class HomeActivity extends AppCompatActivity {
             saveSitesToPrefs();
         }
 
+        for (SiteItem s : siteList) {
+            preloadSiteOgBitmapInBackground(s);
+        }
+
         if (currentSite == null && !siteList.isEmpty()) {
             switchToSiteInstantInternal(siteList.get(0), false, false);
         }
-        preloadRemainingSitesInBackground();
     }
 
     private void updateUIForCurrentSite() {
         if (currentSite == null) return;
-        if (progressBar != null) progressBar.setIndicatorColor(Color.parseColor("#00F5A0"));
+        int customAccent = parseColorSafe(sharedPrefs.getString("APP_COLOR", "#00F5A0"), Color.parseColor("#00F5A0"));
+        if (progressBar != null) progressBar.setIndicatorColor(customAccent);
         if (tvHubBadge != null) {
             String letter = currentSite.name.isEmpty() ? "P" : String.valueOf(currentSite.name.charAt(0)).toUpperCase(Locale.ROOT);
             tvHubBadge.setText("HUB • " + letter);
@@ -4678,7 +5869,7 @@ public class HomeActivity extends AppCompatActivity {
             final boolean isDlRunning = updateLiveDownloadNotificationsAndSpeedStatic(appContextRef);
 
             AlertDialog.Builder builder = new AlertDialog.Builder(this);
-            LinearLayout root = createStyledDialogCard();
+            final LinearLayout root = createStyledDialogCard();
 
             TextView title = new TextView(this);
             title.setText("Exit ProStream?");
@@ -4708,50 +5899,50 @@ public class HomeActivity extends AppCompatActivity {
             btnRow.setGravity(Gravity.END);
 
             TextView btnStay = createDialogButton("Cancel", "#94A3B8", "#1E2230");
-            btnStay.setOnClickListener(v -> dialog.dismiss());
+            attachTouchBounceAnimation(btnStay);
+            btnStay.setOnClickListener(v -> dismissPopupWithAnimation(dialog, root, null));
 
             TextView btnExit = createDialogButton("Exit", "#FFFFFF", isDlRunning ? "#00A884" : "#E50914");
             LinearLayout.LayoutParams exitParams = new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             exitParams.setMargins(dpToPx(8), 0, 0, 0);
             btnExit.setLayoutParams(exitParams);
+            attachTouchBounceAnimation(btnExit);
             btnExit.setOnClickListener(v -> {
-                dialog.dismiss();
-                if (webView != null && webView.getUrl() != null) {
-                    saveCookiesToVault(webView.getUrl());
-                }
-                saveSitesToPrefs();
-                CookieManager.getInstance().flush();
-                if (isDlRunning) {
-                    startBackgroundDownloadKeeperService(appContextRef);
-                    acquireTurboDownloadBoosterStatic(appContextRef);
-                    startNotificationProgressTrackerStatic(appContextRef);
-                }
-                moveTaskToBack(true);
+                dismissPopupWithAnimation(dialog, root, () -> {
+                    sessionAlive = false;
+                    sessionUnlocked = false;
+                    resetAllWebViewsToSiteHome();
+                    saveSitesToPrefs();
+                    CookieManager.getInstance().flush();
+                    if (isDlRunning) {
+                        startBackgroundDownloadKeeperService(appContextRef);
+                        acquireTurboDownloadBoosterStatic(appContextRef);
+                        startNotificationProgressTrackerStatic(appContextRef);
+                    }
+                    finishAffinity();
+                });
             });
 
             btnRow.addView(btnStay);
             btnRow.addView(btnExit);
             root.addView(btnRow);
 
-            dialog.show();
+            showAnimatedDialog(dialog, root);
         }
     }
 
     static class SiteItem {
-        String name, url, color, ogImage, lastVisitedUrl;
+        String name, url, color, ogImage;
+
         SiteItem(String name, String url, String color, String ogImage) {
             this.name = name;
             this.url = url;
             this.color = color;
             this.ogImage = ogImage != null ? ogImage : "";
-            this.lastVisitedUrl = "";
         }
 
         String getEffectiveUrl() {
-            if (lastVisitedUrl != null && !lastVisitedUrl.isEmpty() && lastVisitedUrl.startsWith("http")) {
-                return lastVisitedUrl;
-            }
             return url;
         }
     }
