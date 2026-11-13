@@ -241,6 +241,23 @@ public class HomeActivity extends AppCompatActivity {
         }
     }
 
+    /** Cloudflare "Just a moment" / Turnstile যাচাই পেজ কি না।
+     *  যাচাই চলাকালীন পেজ রিলোড করলে Cloudflare আবার প্রথম থেকে শুরু করে,
+     *  তাই এই পেজে কখনো রিলোড/রিসেট করা যাবে না। */
+    private static boolean isCloudflareChallengePage(WebView view) {
+        if (view == null) return false;
+        try {
+            String title = view.getTitle() != null ? view.getTitle().toLowerCase(Locale.ROOT) : "";
+            String url = view.getUrl() != null ? view.getUrl().toLowerCase(Locale.ROOT) : "";
+            return title.contains("just a moment")
+                    || title.contains("attention required")
+                    || url.contains("challenges.cloudflare.com")
+                    || url.contains("/cdn-cgi/");
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     private View rootLayout;
     private LinearProgressIndicator progressBar;
     private SwipeRefreshLayout swipeRefresh;
@@ -959,6 +976,11 @@ public class HomeActivity extends AppCompatActivity {
     private void reloadActivePageCleanly() {
         hideModernOfflineScreen();
         if (webView != null) {
+            // Cloudflare যাচাই চলাকালীন রিলোড করলে যাচাই আবার প্রথম থেকে শুরু হয়
+            if (isCloudflareChallengePage(webView)) {
+                if (swipeRefresh != null) swipeRefresh.setRefreshing(false);
+                return;
+            }
             String retryUrl = lastFailedUrlMap.get(webView);
             String curUrl = webView.getUrl();
             if (retryUrl != null && !retryUrl.isEmpty()) {
@@ -5699,6 +5721,8 @@ public class HomeActivity extends AppCompatActivity {
             WebView wv = webViewPool.get(s.url);
             if (wv != null) {
                 try {
+                    // যাচাই চলমান পেজে হাত দেওয়া যাবে না — রিসেট করলে Cloudflare আবার শুরু করে
+                    if (isCloudflareChallengePage(wv)) continue;
                     wv.stopLoading();
                     wv.evaluateJavascript("(function(){var m=document.querySelectorAll('video,audio');for(var i=0;i<m.length;i++){try{m[i].pause();m[i].src='';}catch(e){}}})();", null);
                     String currentUrl = wv.getUrl();
@@ -5756,9 +5780,10 @@ public class HomeActivity extends AppCompatActivity {
     @Override
     protected void onStop() {
         super.onStop();
-        if (!isChangingConfigurations() && (leftAppToBackground || !launchingInternalActivity)) {
-            resetAllWebViewsToSiteHome();
-        }
+        // ব্যাকগ্রাউন্ডে গেলে সাইট হোমে রিসেট করা হয় না: রিসেট করলে প্রত্যেকবার
+        // ফিরে এসে পেজ আবার লোড হতো আর Cloudflare আবার যাচাই শুরু করতো।
+        // WebView পুলেই থাকে, ফিরে এসে ইউজার ঠিক যেখানে ছিল সেখানেই পাবে।
+        // ভিডিও আগেই onPause-এ থামানো হয়। হোমে ফেরা শুধু Exit বাটনে হয়।
         CookieManager.getInstance().flush();
     }
 
