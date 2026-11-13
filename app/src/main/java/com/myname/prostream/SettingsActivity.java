@@ -13,6 +13,8 @@ import android.os.Bundle;
 import android.provider.Settings;
 import android.view.View;
 import android.view.animation.DecelerateInterpolator;
+import android.webkit.CookieManager;
+import android.webkit.WebStorage;
 import android.webkit.WebView;
 import android.widget.ImageView;
 import android.widget.TextView;
@@ -70,7 +72,10 @@ public class SettingsActivity extends AppCompatActivity {
 
         clearCacheButton.setOnClickListener(v -> {
             new WebView(this).clearCache(true);
-            Toast.makeText(this, "ক্যাশ মেমোরি ক্লিয়ার করা হয়েছে!", Toast.LENGTH_SHORT).show();
+            CookieManager.getInstance().removeAllCookies(null);
+            CookieManager.getInstance().flush();
+            WebStorage.getInstance().deleteAllData();
+            Toast.makeText(this, "ক্যাশ ও কুকি ক্লিয়ার করা হয়েছে!", Toast.LENGTH_SHORT).show();
         });
 
         applyThemeColor();
@@ -116,7 +121,7 @@ public class SettingsActivity extends AppCompatActivity {
 
     private void applyThemeColor() {
         String hex = prefs.getString("APP_COLOR", "#0D9488");
-        int color = Color.parseColor(hex);
+        int color = AppUtil.parseColorSafe(hex, Color.parseColor("#0D9488"));
 
         getWindow().setStatusBarColor(color);
         toolbarSettings.setTitleTextColor(color);
