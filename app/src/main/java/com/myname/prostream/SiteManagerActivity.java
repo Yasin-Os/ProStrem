@@ -81,7 +81,7 @@ public class SiteManagerActivity extends AppCompatActivity {
                 iconCard.setLayoutParams(new LinearLayout.LayoutParams(dpToPx(44), dpToPx(44)));
                 iconCard.setRadius(dpToPx(12));
                 iconCard.setCardElevation(0);
-                iconCard.setCardBackgroundColor(Color.parseColor(colorHex));
+                iconCard.setCardBackgroundColor(AppUtil.parseColorSafe(colorHex, Color.parseColor("#0D9488")));
 
                 TextView tvLetter = new TextView(this);
                 tvLetter.setLayoutParams(new LinearLayout.LayoutParams(
@@ -208,6 +208,17 @@ public class SiteManagerActivity extends AppCompatActivity {
                 url = "https://" + url;
             }
 
+            // ডুপ্লিকেট URL ঠেকানো (নিজের এন্ট্রি বাদে)
+            try {
+                for (int i = 0; i < sitesArray.length(); i++) {
+                    if (i == index) continue;
+                    if (url.equalsIgnoreCase(sitesArray.getJSONObject(i).optString("url", ""))) {
+                        Toast.makeText(this, "এই URL already আছে!", Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                }
+            } catch (Exception ignored) {}
+
             int selectedColor = Color.rgb(seekRed.getProgress(), seekGreen.getProgress(), seekBlue.getProgress());
             String hexColor = String.format("#%06X", (0xFFFFFF & selectedColor));
 
@@ -230,7 +241,7 @@ public class SiteManagerActivity extends AppCompatActivity {
             }
         });
 
-        if (index != -1 && sitesArray.length() > 1) {
+        if (index != -1) {
             builder.setNeutralButton("ডিলিট", (dialog, which) -> {
                 sitesArray.remove(index);
                 prefs.edit().putString("SITES_JSON", sitesArray.toString()).apply();
@@ -258,7 +269,7 @@ public class SiteManagerActivity extends AppCompatActivity {
 
     private void applyDynamicTheme() {
         String hex = prefs.getString("APP_COLOR", "#0D9488");
-        int color = Color.parseColor(hex);
+        int color = AppUtil.parseColorSafe(hex, Color.parseColor("#0D9488"));
 
         getWindow().setStatusBarColor(color);
         toolbarSites.setTitleTextColor(color);
