@@ -62,6 +62,36 @@ jobs:
           echo "APK ready:"
           ls -lh ./ProStream.apk
 
+      - name: Sign APK with release keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ALIAS }}
+        shell: bash
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "No release keystore configured — keeping debug signature."
+            exit 0
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > /tmp/release.keystore
+          APKSIGNER=""
+          for DIR in "$ANDROID_HOME" "$ANDROID_SDK_ROOT" "$HOME/Android/Sdk" /opt/android-sdk /usr/lib/android-sdk; do
+            [ -n "$DIR" ] || continue
+            FOUND=$(find "$DIR" -maxdepth 4 -name apksigner -type f 2>/dev/null | head -n 1)
+            if [ -n "$FOUND" ]; then APKSIGNER="$FOUND"; break; fi
+          done
+          if [ -z "$APKSIGNER" ]; then
+            echo "apksigner not found — keeping debug signature."
+            rm -f /tmp/release.keystore
+            exit 0
+          fi
+          "$APKSIGNER" sign --ks /tmp/release.keystore --ks-pass "pass:$KEY_STORE_PASSWORD" --key-pass "pass:$KEY_PASSWORD" --ks-key-alias "$KEY_ALIAS" --out /tmp/ProStream-signed.apk ./ProStream.apk
+          "$APKSIGNER" verify --verbose /tmp/ProStream-signed.apk
+          mv /tmp/ProStream-signed.apk ./ProStream.apk
+          rm -f /tmp/release.keystore
+          echo "APK signed with release keystore."
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

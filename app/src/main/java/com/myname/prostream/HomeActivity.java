@@ -5523,27 +5523,27 @@ public class HomeActivity extends AppCompatActivity {
         });
     }
 
-    /** আপডেট APK ইনস্টলের আগে যাচাই: একই প্যাকেজ নাম + একই সাইনিং সার্টিফিকেট হতে হবে। */
-    private boolean isValidUpdateApk(File apkFile) {
-        if (apkFile == null || !apkFile.exists() || apkFile.length() == 0) return false;
+    /** আপডেট APK যাচাইয়ের ফল: 0 = ঠিক আছে, 1 = ফাইল নষ্ট/প্যাকেজ মিলছে না, 2 = সাইন মিলছে না। */
+    private int checkUpdateApk(File apkFile) {
+        if (apkFile == null || !apkFile.exists() || apkFile.length() == 0) return 1;
         try {
             PackageManager pm = getPackageManager();
             int flags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
                     ? PackageManager.GET_SIGNING_CERTIFICATES
                     : PackageManager.GET_SIGNATURES;
             PackageInfo apkInfo = pm.getPackageArchiveInfo(apkFile.getAbsolutePath(), flags);
-            if (apkInfo == null || !getPackageName().equals(apkInfo.packageName)) return false;
+            if (apkInfo == null || !getPackageName().equals(apkInfo.packageName)) return 1;
             PackageInfo installed = pm.getPackageInfo(getPackageName(), flags);
-            if (installed == null) return false;
+            if (installed == null) return 1;
             Signature[] apkSigs = getApkSignatures(apkInfo);
             Signature[] installedSigs = getApkSignatures(installed);
-            if (apkSigs == null || installedSigs == null || apkSigs.length != installedSigs.length) return false;
+            if (apkSigs == null || installedSigs == null || apkSigs.length != installedSigs.length) return 2;
             for (int i = 0; i < apkSigs.length; i++) {
-                if (!apkSigs[i].equals(installedSigs[i])) return false;
+                if (!apkSigs[i].equals(installedSigs[i])) return 2;
             }
-            return true;
+            return 0;
         } catch (Exception e) {
-            return false;
+            return 1;
         }
     }
 
@@ -5558,9 +5558,14 @@ public class HomeActivity extends AppCompatActivity {
 
     private void installDownloadedUpdateApk(File apkFile) {
         if (apkFile == null || !apkFile.exists()) return;
-        if (!isValidUpdateApk(apkFile)) {
+        int check = checkUpdateApk(apkFile);
+        if (check != 0) {
             try { apkFile.delete(); } catch (Exception ignored) {}
-            Toast.makeText(this, "Update APK যাচাই করা যায়নি — ইনস্টল বন্ধ করা হয়েছে।", Toast.LENGTH_LONG).show();
+            if (check == 2) {
+                showSignatureMismatchDialog();
+            } else {
+                Toast.makeText(this, "Update ফাইলটি ঠিকভাবে নামেনি — আবার চেষ্টা করুন।", Toast.LENGTH_LONG).show();
+            }
             return;
         }
         try {
@@ -5643,6 +5648,48 @@ public class HomeActivity extends AppCompatActivity {
         } catch (Exception e) {
             Toast.makeText(this, "Update APK saved in Downloads/ProStream folder. Tap to install.", Toast.LENGTH_LONG).show();
         }
+    }
+
+    /** নতুন বিল্ড আলাদা সাইনে সই করা — পুরোনো অ্যাপের ওপরে ইনস্টল করা যাবে না। */
+    private void showSignatureMismatchDialog() {
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        final LinearLayout root = createStyledDialogCard();
+
+        TextView title = new TextView(this);
+        title.setText("⚠️ সাইন মিলছে না");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(17f);
+        title.setTypeface(modernFont, Typeface.BOLD);
+        title.setPadding(0, 0, 0, dpToPx(10));
+        root.addView(title);
+
+        TextView body = new TextView(this);
+        body.setText("নতুন বিল্ডটি আলাদা সাইনে সই করা হয়েছে, তাই পুরোনো অ্যাপের ওপরে ইনস্টল করা যাবে না।\n\nপুরোনো অ্যাপ আনইনস্টল করে নতুনটি ইনস্টল করুন। আনইনস্টল করলে সাইটের তালিকা মুছে যাবে — আগে Settings → Backup দিয়ে ব্যাকআপ নিয়ে নিন।");
+        body.setTextColor(Color.WHITE);
+        body.setTextSize(14f);
+        body.setPadding(0, 0, 0, dpToPx(12));
+        root.addView(body);
+
+        builder.setView(root);
+        final AlertDialog dialog = builder.create();
+        if (dialog.getWindow() != null) {
+            dialog.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        }
+
+        root.addView(createCompactSettingRow("🗑️  আনইনস্টল করুন", "Uninstall", "#E50914", v -> {
+            dismissPopupWithAnimation(dialog, root, () -> {
+                try {
+                    Intent uninstall = new Intent(Intent.ACTION_DELETE, Uri.parse("package:" + getPackageName()));
+                    startActivity(uninstall);
+                } catch (Exception ignored) {}
+            });
+        }));
+
+        root.addView(createCompactSettingRow("ঠিক আছে", "পরে করব", "#00F5A0", v -> {
+            dismissPopupWithAnimation(dialog, root, null);
+        }));
+
+        dialog.show();
     }
 
     private void showShareProStreamDialog() {
