@@ -176,6 +176,8 @@ public class HomeActivity extends AppCompatActivity {
         }
     };
 
+    private volatile boolean videoDetectedToastShownForPage = false;
+
     private static Context appContextRef;
     private static WifiManager.WifiLock turboWifiLock;
     private static PowerManager.WakeLock turboWakeLock;
@@ -276,6 +278,7 @@ public class HomeActivity extends AppCompatActivity {
     private TextView tvHubBadge;
 
     private LinearLayout modernOfflineOverlay;
+    private TextView tvOfflineTitle;
     private TextView tvOfflineUrlInfo;
 
     private SharedPreferences sharedPrefs;
@@ -517,7 +520,7 @@ public class HomeActivity extends AppCompatActivity {
 
         setupNotificationChannelsStatic(appContextRef);
         registerGlobalReceiverIfNeeded(appContextRef);
-        requestAllMobileAndChromePermissions(false);
+        maybeRequestPermissionsWithRationale();
         setupMultiWebViewAndOfflineContainer();
 
         if (swipeRefresh != null) {
@@ -547,6 +550,10 @@ public class HomeActivity extends AppCompatActivity {
 
         if (getIntent() != null && getIntent().getBooleanExtra("OPEN_MEDIA_DIALOG", false)) {
             mainHandler.postDelayed(this::showMediaDownloadsDialog, 350);
+        }
+
+        if (getIntent() != null && getIntent().getBooleanExtra("OPEN_UPDATE_DIALOG", false)) {
+            mainHandler.postDelayed(this::showInAppUpdateCenterDialog, 350);
         }
 
         if (!hasAutoCheckedUpdateThisSession) {
@@ -590,6 +597,9 @@ public class HomeActivity extends AppCompatActivity {
         setIntent(intent);
         if (intent != null && intent.getBooleanExtra("OPEN_MEDIA_DIALOG", false)) {
             showMediaDownloadsDialog();
+        }
+        if (intent != null && intent.getBooleanExtra("OPEN_UPDATE_DIALOG", false)) {
+            showInAppUpdateCenterDialog();
         }
     }
 
@@ -636,6 +646,107 @@ public class HomeActivity extends AppCompatActivity {
                     }
                 } catch (Exception ignored) {}
             }
+        }
+    }
+
+    private void maybeRequestPermissionsWithRationale() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return;
+        if (sharedPrefs.getBoolean("PERM_RATIONALE_SHOWN", false)) {
+            requestAllMobileAndChromePermissions(false);
+            return;
+        }
+        ArrayList<String> missing = new ArrayList<>();
+        if (Build.VERSION.SDK_INT >= 33) {
+            addPermIfNeeded(missing, "android.permission.POST_NOTIFICATIONS");
+            addPermIfNeeded(missing, "android.permission.READ_MEDIA_VIDEO");
+            addPermIfNeeded(missing, "android.permission.READ_MEDIA_AUDIO");
+            addPermIfNeeded(missing, "android.permission.READ_MEDIA_IMAGES");
+        } else {
+            addPermIfNeeded(missing, android.Manifest.permission.READ_EXTERNAL_STORAGE);
+        }
+        sharedPrefs.edit().putBoolean("PERM_RATIONALE_SHOWN", true).apply();
+        if (missing.isEmpty()) {
+            showFirstRunGuideIfNeeded();
+            return;
+        }
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        final LinearLayout root = createStyledDialogCard();
+        TextView title = new TextView(this);
+        title.setText("Permissions");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(17f);
+        title.setTypeface(modernFont, Typeface.BOLD);
+        title.setPadding(0, 0, 0, dpToPx(6));
+        root.addView(title);
+        TextView body = new TextView(this);
+        body.setText("ProStream needs notification and media permissions to show download progress and save videos to your Downloads folder. You can change this anytime in Settings.");
+        body.setTextColor(Color.parseColor("#94A3B8"));
+        body.setTextSize(13f);
+        body.setPadding(0, 0, 0, dpToPx(14));
+        root.addView(body);
+        LinearLayout bottomRow = new LinearLayout(this);
+        bottomRow.setOrientation(LinearLayout.HORIZONTAL);
+        bottomRow.setGravity(Gravity.END);
+        TextView btnLater = createDialogButton("Not now", "#94A3B8", "#1E2230");
+        LinearLayout.LayoutParams laterParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        laterParams.setMargins(0, 0, dpToPx(8), 0);
+        btnLater.setLayoutParams(laterParams);
+        attachTouchBounceAnimation(btnLater);
+        bottomRow.addView(btnLater);
+        TextView btnAllow = createDialogButton("Allow", "#06101E", "#00F5A0");
+        attachTouchBounceAnimation(btnAllow);
+        bottomRow.addView(btnAllow);
+        root.addView(bottomRow);
+        builder.setView(root);
+        final AlertDialog permDialog = builder.create();
+        if (permDialog.getWindow() != null) {
+            permDialog.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        }
+        btnLater.setOnClickListener(v -> dismissPopupWithAnimation(permDialog, root, this::showFirstRunGuideIfNeeded));
+        btnAllow.setOnClickListener(v -> dismissPopupWithAnimation(permDialog, root, () -> requestAllMobileAndChromePermissions(false)));
+        showAnimatedDialog(permDialog, root);
+    }
+
+    private void showFirstRunGuideIfNeeded() {
+        if (sharedPrefs.getBoolean("FIRST_RUN_GUIDE_SHOWN", false)) return;
+        sharedPrefs.edit().putBoolean("FIRST_RUN_GUIDE_SHOWN", true).apply();
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        final LinearLayout root = createStyledDialogCard();
+        TextView title = new TextView(this);
+        title.setText("Welcome to ProStream");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(17f);
+        title.setTypeface(modernFont, Typeface.BOLD);
+        title.setPadding(0, 0, 0, dpToPx(6));
+        root.addView(title);
+        TextView body = new TextView(this);
+        body.setText("1. Pick a site and play a video.\n2. When a video is found, the HUB button shows how many.\n3. Tap HUB, then Downloader to save it.\n4. Add your own sites from HUB → Add Site.");
+        body.setTextColor(Color.parseColor("#94A3B8"));
+        body.setTextSize(13f);
+        body.setPadding(0, 0, 0, dpToPx(14));
+        root.addView(body);
+        LinearLayout bottomRow = new LinearLayout(this);
+        bottomRow.setOrientation(LinearLayout.HORIZONTAL);
+        bottomRow.setGravity(Gravity.END);
+        TextView btnOk = createDialogButton("Got it", "#06101E", "#00F5A0");
+        attachTouchBounceAnimation(btnOk);
+        bottomRow.addView(btnOk);
+        root.addView(bottomRow);
+        builder.setView(root);
+        final AlertDialog guideDialog = builder.create();
+        if (guideDialog.getWindow() != null) {
+            guideDialog.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        }
+        btnOk.setOnClickListener(v -> dismissPopupWithAnimation(guideDialog, root, null));
+        showAnimatedDialog(guideDialog, root);
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == 701) {
+            showFirstRunGuideIfNeeded();
         }
     }
 
@@ -1154,6 +1265,7 @@ public class HomeActivity extends AppCompatActivity {
         card.addView(iconTv);
 
         TextView titleTv = new TextView(this);
+        tvOfflineTitle = titleTv;
         titleTv.setText("No Internet Connection");
         titleTv.setTextColor(Color.WHITE);
         titleTv.setTextSize(17f);
@@ -1196,7 +1308,14 @@ public class HomeActivity extends AppCompatActivity {
     }
 
     private void showModernOfflineScreen(String failingUrl) {
+        showModernOfflineScreen(failingUrl, null);
+    }
+
+    private void showModernOfflineScreen(String failingUrl, String titleOverride) {
         if (modernOfflineOverlay == null) return;
+        if (tvOfflineTitle != null) {
+            tvOfflineTitle.setText(titleOverride != null && !titleOverride.isEmpty() ? titleOverride : "No Internet Connection");
+        }
         if (tvOfflineUrlInfo != null) {
             tvOfflineUrlInfo.setText(failingUrl != null ? failingUrl : "");
         }
@@ -1232,6 +1351,8 @@ public class HomeActivity extends AppCompatActivity {
             siteHistoryStack.push(currentSite);
         }
         currentSite = site;
+        liveDetectedStreamsMap.clear();
+        videoDetectedToastShownForPage = false;
         updateUIForCurrentSite();
         hideModernOfflineScreen();
 
@@ -1386,8 +1507,13 @@ public class HomeActivity extends AppCompatActivity {
                             }
                             showInstantAppSwitcherDialog();
                         } else {
+                            float parentW = rootLayout != null ? rootLayout.getWidth() : getResources().getDisplayMetrics().widthPixels;
+                            float snapX = (v.getX() + v.getWidth() / 2f < parentW / 2f)
+                                    ? dpToPx(8)
+                                    : Math.max(dpToPx(8), parentW - v.getWidth() - dpToPx(8));
+                            v.animate().x(snapX).setDuration(200).start();
                             sharedPrefs.edit()
-                                    .putFloat("HUB_POS_X", v.getX())
+                                    .putFloat("HUB_POS_X", snapX)
                                     .putFloat("HUB_POS_Y", v.getY())
                                     .apply();
                         }
@@ -4030,8 +4156,16 @@ public class HomeActivity extends AppCompatActivity {
                 if (isLikelyRealVideoStreamUrl(url)) {
                     String title = (view != null && view.getTitle() != null && !view.getTitle().isEmpty())
                             ? view.getTitle() : "Detected Video";
+                    boolean isNew = false;
                     synchronized (liveDetectedStreamsMap) {
-                        liveDetectedStreamsMap.put(url, title);
+                        isNew = (liveDetectedStreamsMap.put(url, title) == null);
+                    }
+                    if (isNew && view == webView) {
+                        updateUIForCurrentSite();
+                        if (!videoDetectedToastShownForPage) {
+                            videoDetectedToastShownForPage = true;
+                            Toast.makeText(HomeActivity.this, "Video detected — open HUB, then Downloader to save it", Toast.LENGTH_LONG).show();
+                        }
                     }
                 }
             }
@@ -4047,10 +4181,21 @@ public class HomeActivity extends AppCompatActivity {
                                 new ByteArrayInputStream("".getBytes(StandardCharsets.UTF_8)));
                     }
                     if (isLikelyRealVideoStreamUrl(reqUrl)) {
+                        boolean isNew = false;
                         synchronized (liveDetectedStreamsMap) {
                             if (!liveDetectedStreamsMap.containsKey(reqUrl)) {
                                 liveDetectedStreamsMap.put(reqUrl, "Detected Video");
+                                isNew = true;
                             }
+                        }
+                        if (isNew && view == webView) {
+                            mainHandler.post(() -> {
+                                updateUIForCurrentSite();
+                                if (!videoDetectedToastShownForPage) {
+                                    videoDetectedToastShownForPage = true;
+                                    Toast.makeText(HomeActivity.this, "Video detected — open HUB, then Downloader to save it", Toast.LENGTH_LONG).show();
+                                }
+                            });
                         }
                     }
                 }
@@ -4099,6 +4244,7 @@ public class HomeActivity extends AppCompatActivity {
             @Override
             public void onPageStarted(WebView view, String url, Bitmap favicon) {
                 super.onPageStarted(view, url, favicon);
+                videoDetectedToastShownForPage = false;
                 if (url != null && !url.startsWith("about:blank")) {
                     if (view == webView) {
                         hideModernOfflineScreen();
@@ -4140,7 +4286,51 @@ public class HomeActivity extends AppCompatActivity {
                         if (progressBar != null) progressBar.setVisibility(View.GONE);
                         showModernOfflineScreen(failingUrl);
                     }
+                } else if (view == webView && !isCloudflareChallengePage(view) && isSiteDownError(errCode, errDesc)) {
+                    String failingUrl = request.getUrl() != null ? request.getUrl().toString() : "";
+                    if (failingUrl.startsWith("http")) {
+                        lastFailedUrlMap.put(view, failingUrl);
+                    }
+                    view.stopLoading();
+                    if (swipeRefresh != null) swipeRefresh.setRefreshing(false);
+                    if (progressBar != null) progressBar.setVisibility(View.GONE);
+                    showModernOfflineScreen(failingUrl, "Site can't be reached");
                 }
+            }
+
+            @Override
+            public void onReceivedHttpError(WebView view, WebResourceRequest request, WebResourceResponse errorResponse) {
+                super.onReceivedHttpError(view, request, errorResponse);
+                if (request == null || !request.isForMainFrame() || view != webView) return;
+                if (errorResponse == null) return;
+                int code = errorResponse.getStatusCode();
+                if (code != 404 && code != 500 && code != 502 && code != 503 && code != 504) return;
+                if (isCloudflareChallengePage(view)) return;
+                String failingUrl = request.getUrl() != null ? request.getUrl().toString() : "";
+                view.stopLoading();
+                if (swipeRefresh != null) swipeRefresh.setRefreshing(false);
+                if (progressBar != null) progressBar.setVisibility(View.GONE);
+                showModernOfflineScreen(failingUrl, "Site error (" + code + ")");
+            }
+
+            private boolean isSiteDownError(int errCode, String errDesc) {
+                if (errCode == WebViewClient.ERROR_HOST_LOOKUP
+                        || errCode == WebViewClient.ERROR_CONNECT
+                        || errCode == WebViewClient.ERROR_TIMEOUT
+                        || errCode == WebViewClient.ERROR_REDIRECT_LOOP
+                        || errCode == WebViewClient.ERROR_UNKNOWN) {
+                    return true;
+                }
+                if (errDesc == null) return false;
+                return errDesc.contains("ERR_NAME_NOT_RESOLVED")
+                        || errDesc.contains("ERR_CONNECTION_REFUSED")
+                        || errDesc.contains("ERR_CONNECTION_TIMED_OUT")
+                        || errDesc.contains("ERR_CONNECTION_RESET")
+                        || errDesc.contains("ERR_CONNECTION_CLOSED")
+                        || errDesc.contains("ERR_HOST_UNREACHABLE")
+                        || errDesc.contains("ERR_TUNNEL_CONNECTION_FAILED")
+                        || errDesc.contains("ERR_ADDRESS_UNREACHABLE")
+                        || errDesc.contains("ERR_DNS");
             }
 
             @Override
@@ -6043,6 +6233,9 @@ public class HomeActivity extends AppCompatActivity {
         startFloatingHubBreathingAnimation();
         startNotificationProgressTrackerStatic(appContextRef);
         applyDynamicTheme();
+        if (modernOfflineOverlay != null && modernOfflineOverlay.getVisibility() == View.VISIBLE && isNetworkAvailable()) {
+            reloadActivePageCleanly();
+        }
     }
 
     @Override
@@ -6203,7 +6396,8 @@ public class HomeActivity extends AppCompatActivity {
         if (progressBar != null) progressBar.setIndicatorColor(customAccent);
         if (tvHubBadge != null) {
             String letter = currentSite.name.isEmpty() ? "P" : String.valueOf(currentSite.name.charAt(0)).toUpperCase(Locale.ROOT);
-            tvHubBadge.setText("HUB • " + letter);
+            int detected = liveDetectedStreamsMap.size();
+            tvHubBadge.setText("HUB • " + letter + (detected > 0 ? " • " + detected : ""));
         }
     }
 
@@ -6293,7 +6487,7 @@ public class HomeActivity extends AppCompatActivity {
             attachTouchBounceAnimation(btnStay);
             btnStay.setOnClickListener(v -> dismissPopupWithAnimation(dialog, root, null));
 
-            TextView btnExit = createDialogButton("Exit", "#FFFFFF", isDlRunning ? "#00A884" : "#E50914");
+            TextView btnExit = createDialogButton("Exit", "#FFFFFF", "#E50914");
             LinearLayout.LayoutParams exitParams = new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             exitParams.setMargins(dpToPx(8), 0, 0, 0);
