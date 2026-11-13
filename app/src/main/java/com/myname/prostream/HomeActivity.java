@@ -322,6 +322,11 @@ public class HomeActivity extends AppCompatActivity {
         boolean isHls = false;
         volatile int totalSegments = 0;
         volatile int completedSegments = 0;
+        volatile boolean paused = false;
+        volatile String errorMessage = "";
+        volatile boolean exporting = false;
+        String refererUrl = "";
+        volatile long[] partProgress = null;
 
         CustomDownloadTask(long id, String title, String url, File outputFile, boolean isHls) {
             this.id = id;
@@ -968,6 +973,15 @@ public class HomeActivity extends AppCompatActivity {
             return String.format(Locale.US, "%.2f GB", mb / 1024.0);
         }
         return String.format(Locale.US, "%.1f MB", mb);
+    }
+
+    private static String formatEtaStatic(long secondsRemaining) {
+        if (secondsRemaining < 0) return "";
+        if (secondsRemaining < 60) return secondsRemaining + "s left";
+        long m = secondsRemaining / 60;
+        if (m < 60) return m + "m " + (secondsRemaining % 60) + "s left";
+        long h = m / 60;
+        return h + "h " + (m % 60) + "m left";
     }
 
     private boolean isNetworkAvailable() {
@@ -2387,12 +2401,15 @@ public class HomeActivity extends AppCompatActivity {
             qDialog.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
         }
 
-        for (int i = 0; i < Math.min(candidates.size(), 8); i++) {
+        for (int i = 0; i < Math.min(candidates.size(), 12); i++) {
             final ExtractedMediaCandidate item = candidates.get(i);
             View row = createCompactSettingRow("⬇  " + item.label, item.isHls ? "Stream" : "Direct", "#00F5A0", v -> {
                 dismissPopupWithAnimation(qDialog, root, () -> launchBestDownloadEngine(item.url, refererPageUrl, baseTitle, item.isHls));
             });
             list.addView(row);
+            if (!item.isHls) {
+                fetchAndShowCandidateSize(item.url, row);
+            }
         }
 
         LinearLayout bottomRow = new LinearLayout(this);
@@ -2408,9 +2425,72 @@ public class HomeActivity extends AppCompatActivity {
     }
 
     private void launchBestDownloadEngine(String mediaUrl, String refererUrl, String customTitle, boolean isHlsStream) {
-        String safeName = buildCleanVideoFileName(mediaUrl, customTitle);
-        boolean hls = isHlsStream || mediaUrl.toLowerCase(Locale.ROOT).contains(".m3u8");
-        startCustomStreamOrDirectDownload(mediaUrl, refererUrl, safeName, hls);
+        showDownloadConfirmDialog(mediaUrl, refererUrl, customTitle, isHlsStream);
+    }
+
+    private void showDownloadConfirmDialog(final String mediaUrl, final String refererUrl, final String customTitle, final boolean isHlsStream) {
+        final boolean hls = isHlsStream || mediaUrl.toLowerCase(Locale.ROOT).contains(".m3u8");
+        final String defaultName = buildCleanVideoFileName(mediaUrl, customTitle);
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        final LinearLayout root = createStyledDialogCard();
+
+        TextView title = new TextView(this);
+        title.setText("Download video");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(17f);
+        title.setTypeface(modernFont, Typeface.BOLD);
+        title.setPadding(0, 0, 0, dpToPx(4));
+        root.addView(title);
+
+        TextView tvInfo = new TextView(this);
+        tvInfo.setText(guessQualityLabelFromUrl(mediaUrl, hls ? "HLS Stream" : "Video") + " • " + (hls ? "HLS Stream" : "Direct download"));
+        tvInfo.setTextColor(Color.parseColor("#94A3B8"));
+        tvInfo.setTextSize(12f);
+        tvInfo.setPadding(0, 0, 0, dpToPx(12));
+        root.addView(tvInfo);
+
+        TextView tvNameLabel = new TextView(this);
+        tvNameLabel.setText("File name");
+        tvNameLabel.setTextColor(Color.parseColor("#94A3B8"));
+        tvNameLabel.setTextSize(12f);
+        tvNameLabel.setPadding(0, 0, 0, dpToPx(4));
+        root.addView(tvNameLabel);
+
+        final EditText inputName = createStyledEditText("File name", defaultName, false);
+        inputName.setSelection(inputName.getText().length());
+        root.addView(inputName);
+
+        LinearLayout bottomRow = new LinearLayout(this);
+        bottomRow.setOrientation(LinearLayout.HORIZONTAL);
+        bottomRow.setGravity(Gravity.END);
+        bottomRow.setPadding(0, dpToPx(10), 0, 0);
+
+        TextView btnCancel = createDialogButton("Cancel", "#94A3B8", "#1E2230");
+        LinearLayout.LayoutParams cancelParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        cancelParams.setMargins(0, 0, dpToPx(8), 0);
+        btnCancel.setLayoutParams(cancelParams);
+        attachTouchBounceAnimation(btnCancel);
+        bottomRow.addView(btnCancel);
+
+        TextView btnDownload = createDialogButton("Download", "#06101E", "#00F5A0");
+        attachTouchBounceAnimation(btnDownload);
+        bottomRow.addView(btnDownload);
+        root.addView(bottomRow);
+
+        builder.setView(root);
+        final AlertDialog confirmDialog = builder.create();
+        if (confirmDialog.getWindow() != null) {
+            confirmDialog.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        }
+        btnCancel.setOnClickListener(v -> dismissPopupWithAnimation(confirmDialog, root, null));
+        btnDownload.setOnClickListener(v -> {
+            String typedName = inputName.getText() != null ? inputName.getText().toString().trim() : "";
+            String finalName = buildCleanVideoFileName(mediaUrl, typedName.isEmpty() ? defaultName : typedName);
+            dismissPopupWithAnimation(confirmDialog, root, () -> startCustomStreamOrDirectDownload(mediaUrl, refererUrl, finalName, hls));
+        });
+        showAnimatedDialog(confirmDialog, root);
     }
 
     private String buildCleanVideoFileName(String mediaUrl, String customTitle) {
@@ -2500,11 +2580,46 @@ public class HomeActivity extends AppCompatActivity {
         return "";
     }
 
+    private void fetchAndShowCandidateSize(final String mediaUrl, final View row) {
+        bgExecutor.execute(() -> {
+            HttpURLConnection conn = null;
+            try {
+                conn = openBrowserLikeConnectionWithRedirects(mediaUrl, null, "bytes=0-0");
+                long total = -1;
+                String contentRange = conn.getHeaderField("Content-Range");
+                if (contentRange != null && contentRange.contains("/")) {
+                    try {
+                        total = Long.parseLong(contentRange.substring(contentRange.lastIndexOf('/') + 1).trim());
+                    } catch (Exception ignored) {}
+                }
+                if (total <= 0) {
+                    long len = Build.VERSION.SDK_INT >= Build.VERSION_CODES.N ? conn.getContentLengthLong() : conn.getContentLength();
+                    if (len > 0) total = len;
+                }
+                if (total > 0) {
+                    final String sizeText = "Direct • " + formatBytesStatic(total);
+                    mainHandler.post(() -> {
+                        try {
+                            if (row instanceof LinearLayout) {
+                                View badge = ((LinearLayout) row).getChildAt(1);
+                                if (badge instanceof TextView) ((TextView) badge).setText(sizeText);
+                            }
+                        } catch (Exception ignored) {}
+                    });
+                }
+            } catch (Exception ignored) {
+            } finally {
+                if (conn != null) conn.disconnect();
+            }
+        });
+    }
+
     private void startCustomStreamOrDirectDownload(final String mediaUrl, final String refererUrl, final String fileName, final boolean isHls) {
         final File outFile = getSafeWritableDownloadFile(fileName);
         final long taskId = System.currentTimeMillis();
 
         final CustomDownloadTask task = new CustomDownloadTask(taskId, fileName, mediaUrl, outFile, isHls);
+        task.refererUrl = refererUrl;
         customTasksMap.put(taskId, task);
         trackedDownloadIds.add(String.valueOf(taskId));
         sharedPrefs.edit().putStringSet(PREF_DL_IDS_KEY, new HashSet<>(trackedDownloadIds)).apply();
@@ -2520,6 +2635,29 @@ public class HomeActivity extends AppCompatActivity {
                 executeHlsM3u8Download(task, refererUrl);
             } else {
                 executeDirectHttpTurboDownload(task, refererUrl);
+            }
+        });
+    }
+
+    private void pauseDownloadTask(final CustomDownloadTask task) {
+        if (task == null) return;
+        task.paused = true;
+        task.status = DownloadManager.STATUS_PAUSED;
+    }
+
+    private void resumeDownloadTask(final CustomDownloadTask task) {
+        if (task == null) return;
+        task.paused = false;
+        task.cancelled = false;
+        task.errorMessage = "";
+        task.status = DownloadManager.STATUS_RUNNING;
+        startBackgroundDownloadKeeperService(appContextRef);
+        acquireTurboDownloadBoosterStatic(appContextRef);
+        customDlExecutor.execute(() -> {
+            if (task.isHls) {
+                executeHlsM3u8Download(task, task.refererUrl);
+            } else {
+                executeDirectHttpTurboDownload(task, task.refererUrl);
             }
         });
     }
@@ -2584,6 +2722,10 @@ public class HomeActivity extends AppCompatActivity {
                 conn.disconnect();
                 conn = null;
                 boolean parallelSuccess = executeParallelMultiThreadDownload(task, finalUrl, refererUrl, contentLen, 4);
+                if (task.paused) {
+                    task.status = DownloadManager.STATUS_PAUSED;
+                    return;
+                }
                 if (parallelSuccess && !task.cancelled && task.downloadedBytes.get() > 1024) {
                     finalizeSuccessfulTask(task);
                     return;
@@ -2593,20 +2735,38 @@ public class HomeActivity extends AppCompatActivity {
                     return;
                 }
                 task.downloadedBytes.set(0);
+                if (task.partProgress != null) {
+                    for (int p = 0; p < task.partProgress.length; p++) task.partProgress[p] = 0L;
+                }
                 conn = openBrowserLikeConnectionWithRedirects(finalUrl, refererUrl, null);
             }
 
-            streamSingleConnectionWithResume(task, conn, finalUrl, refererUrl);
+            HttpURLConnection resumeConn = (task.downloadedBytes.get() > 0) ? null : conn;
+            if (resumeConn == null && conn != null) {
+                conn.disconnect();
+                conn = null;
+            }
+            streamSingleConnectionWithResume(task, resumeConn, finalUrl, refererUrl);
+            conn = null;
 
+            if (task.paused) {
+                task.status = DownloadManager.STATUS_PAUSED;
+                return;
+            }
             if (!task.cancelled && task.downloadedBytes.get() > 1024) {
                 finalizeSuccessfulTask(task);
+            } else if (!task.cancelled) {
+                task.status = DownloadManager.STATUS_FAILED;
+                task.errorMessage = "No data received";
+                mainHandler.post(() -> Toast.makeText(appContextRef, "Download failed — tap to retry", Toast.LENGTH_SHORT).show());
             } else {
                 cancelOrRemoveDownloadStatic(appContextRef, task.id);
             }
         } catch (Exception e) {
-            if (!task.cancelled) {
-                cancelOrRemoveDownloadStatic(appContextRef, task.id);
-                mainHandler.post(() -> Toast.makeText(appContextRef, "Download failed", Toast.LENGTH_SHORT).show());
+            if (!task.cancelled && !task.paused) {
+                task.status = DownloadManager.STATUS_FAILED;
+                task.errorMessage = (e.getMessage() != null && !e.getMessage().isEmpty()) ? e.getMessage() : "Network error";
+                mainHandler.post(() -> Toast.makeText(appContextRef, "Download failed — tap to retry", Toast.LENGTH_SHORT).show());
             }
         } finally {
             if (conn != null) conn.disconnect();
@@ -2619,26 +2779,35 @@ public class HomeActivity extends AppCompatActivity {
             rafInit.setLength(totalSize);
             rafInit.close();
 
+            if (task.partProgress == null || task.partProgress.length != numThreads) {
+                task.partProgress = new long[numThreads];
+            }
+
             final long partSize = totalSize / numThreads;
             List<Callable<Boolean>> workers = new ArrayList<>();
             final long[] lastSpeedCheckTime = {System.currentTimeMillis()};
             final long[] lastSpeedCheckBytes = {0L};
 
             for (int i = 0; i < numThreads; i++) {
+                final int partIdx = i;
                 final long startByte = i * partSize;
                 final long endByte = (i == numThreads - 1) ? (totalSize - 1) : ((i + 1) * partSize - 1);
 
                 workers.add(() -> {
                     for (int attempt = 0; attempt < 3; attempt++) {
-                        if (task.cancelled) return false;
+                        if (task.cancelled || task.paused) return false;
                         HttpURLConnection partConn = null;
                         InputStream partIn = null;
                         RandomAccessFile partRaf = null;
-                        long currentOffset = startByte;
+                        long currentOffset = startByte + task.partProgress[partIdx];
+                        if (currentOffset > endByte) return true;
                         try {
                             partConn = openBrowserLikeConnectionWithRedirects(resolvedUrl, refererUrl, "bytes=" + currentOffset + "-" + endByte);
                             int code = partConn.getResponseCode();
                             if (code != HttpURLConnection.HTTP_PARTIAL && code != HttpURLConnection.HTTP_OK) {
+                                return false;
+                            }
+                            if (code == HttpURLConnection.HTTP_OK && currentOffset > startByte) {
                                 return false;
                             }
                             partIn = new BufferedInputStream(partConn.getInputStream(), 128 * 1024);
@@ -2648,9 +2817,10 @@ public class HomeActivity extends AppCompatActivity {
                             byte[] buf = new byte[64 * 1024];
                             int r;
                             while ((r = partIn.read(buf)) != -1) {
-                                if (task.cancelled) return false;
+                                if (task.cancelled || task.paused) return false;
                                 partRaf.write(buf, 0, r);
                                 currentOffset += r;
+                                task.partProgress[partIdx] += r;
                                 long totalNow = task.downloadedBytes.addAndGet(r);
 
                                 long now = System.currentTimeMillis();
@@ -2692,7 +2862,7 @@ public class HomeActivity extends AppCompatActivity {
         long bytesAtLastTick = 0;
 
         for (int attempt = 0; attempt < 3; attempt++) {
-            if (task.cancelled) return;
+            if (task.cancelled || task.paused) return;
             InputStream in = null;
             FileOutputStream fos = null;
             try {
@@ -2701,6 +2871,16 @@ public class HomeActivity extends AppCompatActivity {
                     String rangeHeader = alreadyDownloaded > 0 ? ("bytes=" + alreadyDownloaded + "-") : null;
                     activeConn = openBrowserLikeConnectionWithRedirects(resolvedUrl, refererUrl, rangeHeader);
                 }
+                if (alreadyDownloaded > 0) {
+                    int respCode = activeConn.getResponseCode();
+                    if (respCode != HttpURLConnection.HTTP_PARTIAL) {
+                        alreadyDownloaded = 0;
+                        task.downloadedBytes.set(0);
+                        if (task.partProgress != null) {
+                            for (int p = 0; p < task.partProgress.length; p++) task.partProgress[p] = 0L;
+                        }
+                    }
+                }
 
                 in = new BufferedInputStream(activeConn.getInputStream(), 256 * 1024);
                 fos = new FileOutputStream(task.outputFile, alreadyDownloaded > 0);
@@ -2708,7 +2888,7 @@ public class HomeActivity extends AppCompatActivity {
                 byte[] buffer = new byte[128 * 1024];
                 int read;
                 while ((read = in.read(buffer)) != -1) {
-                    if (task.cancelled) return;
+                    if (task.cancelled || task.paused) return;
                     fos.write(buffer, 0, read);
                     long nowDl = task.downloadedBytes.addAndGet(read);
 
@@ -2738,9 +2918,18 @@ public class HomeActivity extends AppCompatActivity {
     private void finalizeSuccessfulTask(final CustomDownloadTask task) {
         long finalBytes = task.downloadedBytes.get();
         task.totalBytes = finalBytes;
+        task.exporting = true;
         task.publicUriString = exportCompletedFileToPublicDownloads(task.outputFile, task.title);
+        task.exporting = false;
+        String recordPath = task.outputFile.getAbsolutePath();
+        if (task.publicUriString != null && !task.publicUriString.isEmpty()) {
+            try {
+                task.outputFile.delete();
+                recordPath = "";
+            } catch (Exception ignored) {}
+        }
         task.status = DownloadManager.STATUS_SUCCESSFUL;
-        saveCompletedHistoryRecordStatic(appContextRef, task.id, task.title, finalBytes, task.outputFile.getAbsolutePath(), task.publicUriString);
+        saveCompletedHistoryRecordStatic(appContextRef, task.id, task.title, finalBytes, recordPath, task.publicUriString);
         updateSingleCompletedNotificationStatic(appContextRef, task.id);
         mainHandler.post(() -> Toast.makeText(appContextRef, "Completed: " + task.title, Toast.LENGTH_SHORT).show());
     }
@@ -2833,13 +3022,14 @@ public class HomeActivity extends AppCompatActivity {
             final int finalSeqBase = mediaSequenceBase;
 
             task.totalSegments = segmentUrls.size();
-            fos = new FileOutputStream(task.outputFile);
+            boolean resumeHls = task.completedSegments > 0 && task.outputFile.exists() && task.downloadedBytes.get() > 0;
+            fos = new FileOutputStream(task.outputFile, resumeHls);
             long lastTick = System.currentTimeMillis();
             long bytesAtLastTick = 0;
 
             final int batchSize = 4;
-            for (int baseIdx = 0; baseIdx < segmentUrls.size(); baseIdx += batchSize) {
-                if (task.cancelled) break;
+            for (int baseIdx = task.completedSegments; baseIdx < segmentUrls.size(); baseIdx += batchSize) {
+                if (task.cancelled || task.paused) break;
                 int endIdx = Math.min(segmentUrls.size(), baseIdx + batchSize);
                 List<Callable<byte[]>> batchCallables = new ArrayList<>();
 
@@ -2880,15 +3070,24 @@ public class HomeActivity extends AppCompatActivity {
             fos.close();
             fos = null;
 
+            if (task.paused) {
+                task.status = DownloadManager.STATUS_PAUSED;
+                return;
+            }
             if (!task.cancelled && task.downloadedBytes.get() > 1024) {
                 finalizeSuccessfulTask(task);
+            } else if (!task.cancelled) {
+                task.status = DownloadManager.STATUS_FAILED;
+                task.errorMessage = "No data received";
+                mainHandler.post(() -> Toast.makeText(appContextRef, "Stream download failed — tap to retry", Toast.LENGTH_SHORT).show());
             } else {
                 cancelOrRemoveDownloadStatic(appContextRef, task.id);
             }
         } catch (Exception e) {
-            if (!task.cancelled) {
-                cancelOrRemoveDownloadStatic(appContextRef, task.id);
-                mainHandler.post(() -> Toast.makeText(appContextRef, "Stream download failed", Toast.LENGTH_SHORT).show());
+            if (!task.cancelled && !task.paused) {
+                task.status = DownloadManager.STATUS_FAILED;
+                task.errorMessage = (e.getMessage() != null && !e.getMessage().isEmpty()) ? e.getMessage() : "Stream error";
+                mainHandler.post(() -> Toast.makeText(appContextRef, "Stream download failed — tap to retry", Toast.LENGTH_SHORT).show());
             }
         } finally {
             try { if (fos != null) fos.close(); } catch (Exception ignored) {}
@@ -3124,7 +3323,7 @@ public class HomeActivity extends AppCompatActivity {
         Set<Long> renderedIds = new HashSet<>();
 
         for (final CustomDownloadTask task : customTasksMap.values()) {
-            if (task.cancelled || task.status == DownloadManager.STATUS_FAILED) continue;
+            if (task.cancelled) continue;
             renderedIds.add(task.id);
             itemCount++;
             int pct = task.getPercent();
@@ -3132,14 +3331,38 @@ public class HomeActivity extends AppCompatActivity {
             String speedStr = task.speedBps > 0 ? ("  •  " + formatSpeedStatic(task.speedBps)) : "";
             String statusText;
             String badgeColor;
-            boolean isRunning = (task.status == DownloadManager.STATUS_RUNNING);
+            String actionLabel = null;
+            View.OnClickListener actionListener = null;
+            boolean isRunning = (task.status == DownloadManager.STATUS_RUNNING || task.status == DownloadManager.STATUS_PAUSED);
 
-            if (isRunning) {
+            if (task.exporting) {
+                statusText = "Saving to Downloads…";
+                badgeColor = "#38BDF8";
+            } else if (task.status == DownloadManager.STATUS_RUNNING) {
                 String sz = task.totalBytes > 0
                         ? (formatBytesStatic(dl) + " / " + formatBytesStatic(task.totalBytes))
                         : formatBytesStatic(dl);
                 statusText = pct + "%  •  " + sz + speedStr;
+                if (task.speedBps > 0 && task.totalBytes > 0 && dl < task.totalBytes) {
+                    long remainingSec = (task.totalBytes - dl) / Math.max(1L, task.speedBps);
+                    statusText += "  •  " + formatEtaStatic(remainingSec);
+                }
                 badgeColor = "#00E5FF";
+                actionLabel = "⏸ Pause";
+                actionListener = v -> { pauseDownloadTask(task); populateLiveDownloadsList(container, parentDialog); };
+            } else if (task.status == DownloadManager.STATUS_PAUSED) {
+                String sz = task.totalBytes > 0
+                        ? (formatBytesStatic(dl) + " / " + formatBytesStatic(task.totalBytes))
+                        : formatBytesStatic(dl);
+                statusText = pct + "%  •  Paused  •  " + sz;
+                badgeColor = "#FDE047";
+                actionLabel = "▶ Resume";
+                actionListener = v -> { resumeDownloadTask(task); populateLiveDownloadsList(container, parentDialog); };
+            } else if (task.status == DownloadManager.STATUS_FAILED) {
+                statusText = "Failed" + (task.errorMessage.isEmpty() ? "" : "  •  " + task.errorMessage) + "  •  Tap to retry";
+                badgeColor = "#FDA4AF";
+                actionLabel = "↻ Retry";
+                actionListener = v -> { resumeDownloadTask(task); populateLiveDownloadsList(container, parentDialog); };
             } else {
                 pct = 100;
                 statusText = formatBytesStatic(dl) + "  •  Completed";
@@ -3147,14 +3370,17 @@ public class HomeActivity extends AppCompatActivity {
             }
 
             addMediaDownloadCardRow(container, task.id, task.title, statusText, badgeColor, pct, isRunning, v -> {
-                if (!isRunning) {
+                if (task.status == DownloadManager.STATUS_SUCCESSFUL) {
                     parentDialog.dismiss();
                     openDownloadedVideoItem(task.publicUriString, task.outputFile != null ? task.outputFile.getAbsolutePath() : "");
+                } else if (task.status == DownloadManager.STATUS_FAILED || task.status == DownloadManager.STATUS_PAUSED) {
+                    resumeDownloadTask(task);
+                    populateLiveDownloadsList(container, parentDialog);
                 }
             }, v -> {
                 cancelOrRemoveDownloadStatic(appContextRef, task.id);
                 populateLiveDownloadsList(container, parentDialog);
-            });
+            }, actionLabel, actionListener);
         }
 
         try {
@@ -3184,7 +3410,7 @@ public class HomeActivity extends AppCompatActivity {
                 }, v -> {
                     cancelOrRemoveDownloadStatic(appContextRef, hid);
                     populateLiveDownloadsList(container, parentDialog);
-                });
+                }, null, null);
             }
         } catch (Exception ignored) {}
 
@@ -3248,7 +3474,7 @@ public class HomeActivity extends AppCompatActivity {
                         }, v -> {
                             cancelOrRemoveDownloadStatic(appContextRef, id);
                             populateLiveDownloadsList(container, parentDialog);
-                        });
+                        }, null, null);
                     }
                     c.close();
                 }
@@ -3298,7 +3524,7 @@ public class HomeActivity extends AppCompatActivity {
 
             FrameLayout videoContainer = new FrameLayout(this);
             LinearLayout.LayoutParams vcParams = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, dpToPx(240));
+                    ViewGroup.LayoutParams.MATCH_PARENT, dpToPx(320));
             vcParams.setMargins(0, 0, 0, dpToPx(12));
             videoContainer.setLayoutParams(vcParams);
             videoContainer.setBackgroundColor(Color.BLACK);
@@ -3404,7 +3630,7 @@ public class HomeActivity extends AppCompatActivity {
         Toast.makeText(this, "Saved in Downloads/ProStream folder", Toast.LENGTH_LONG).show();
     }
 
-    private void addMediaDownloadCardRow(LinearLayout container, long dlId, String fileTitle, String statusText, String badgeColor, int percent, boolean isRunning, View.OnClickListener clickListener, View.OnClickListener removeListener) {
+    private void addMediaDownloadCardRow(LinearLayout container, long dlId, String fileTitle, String statusText, String badgeColor, int percent, boolean isRunning, View.OnClickListener clickListener, View.OnClickListener removeListener, String actionLabel, View.OnClickListener actionListener) {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
         card.setPadding(dpToPx(12), dpToPx(10), dpToPx(12), dpToPx(10));
@@ -3432,6 +3658,17 @@ public class HomeActivity extends AppCompatActivity {
         tvName.setEllipsize(TextUtils.TruncateAt.END);
         tvName.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         topRow.addView(tvName);
+
+        if (actionLabel != null && !actionLabel.isEmpty() && actionListener != null) {
+            TextView btnAction = new TextView(this);
+            btnAction.setText(actionLabel);
+            btnAction.setTextColor(Color.parseColor("#00F5A0"));
+            btnAction.setTextSize(12f);
+            btnAction.setTypeface(modernFont, Typeface.BOLD);
+            btnAction.setPadding(dpToPx(8), dpToPx(2), dpToPx(8), dpToPx(2));
+            btnAction.setOnClickListener(actionListener);
+            topRow.addView(btnAction);
+        }
 
         TextView btnRemove = new TextView(this);
         btnRemove.setText("✕");
