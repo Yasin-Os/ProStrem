@@ -4871,7 +4871,7 @@ public class HomeActivity extends AppCompatActivity {
         root.addView(title);
 
         int lockType = sharedPrefs.getInt("LOCK_TYPE", 1);
-        boolean useBio = sharedPrefs.getBoolean("USE_BIOMETRIC", true);
+        boolean useBio = sharedPrefs.getBoolean("USE_BIOMETRIC", false);
 
         final RadioGroup rg = new RadioGroup(this);
         rg.setOrientation(RadioGroup.VERTICAL);
