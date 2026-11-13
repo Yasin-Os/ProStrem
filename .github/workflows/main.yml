@@ -101,5 +101,5 @@ jobs:
           gh release create "$TAG" \
             ./ProStream.apk#ProStream.apk \
             --title "ProStream Build ${{ github.run_number }}" \
-            --notes "Automatic ProStream APK build (#${{ github.run_number }}) with In-App Updater." \
+            --notes "Automatic ProStream APK build (#${{ github.run_number }}), signed with the release keystore." \
             --latest
