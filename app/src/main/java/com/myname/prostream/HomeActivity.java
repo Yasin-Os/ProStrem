@@ -4588,12 +4588,21 @@ public class HomeActivity extends AppCompatActivity {
         return "2.0." + getInstalledBuildNumber();
     }
 
+    // রিলিজ নোটের প্রথম লাইন (সর্বোচ্চ maxLen অক্ষর) — আপডেট ডায়ালগে পুরো
+    // চেঞ্জলগ না দেখিয়ে শুধু প্রথম লাইন দেখানো হয়
+    private static String firstLineOrDefault(String text, int maxLen) {
+        if (text == null || text.trim().isEmpty()) return "Tap Update Now to install.";
+        String first = text.trim().split("\\n", 2)[0].trim();
+        if (first.length() > maxLen) first = first.substring(0, maxLen).trim() + "…";
+        return first;
+    }
+
     private void showInAppUpdateCenterDialog() {
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
         final LinearLayout root = createStyledDialogCard();
 
         TextView title = new TextView(this);
-        title.setText("🔄 ProStream In-App Updater");
+        title.setText("ProStream Updater");
         title.setTextColor(Color.WHITE);
         title.setTextSize(17f);
         title.setTypeface(modernFont, Typeface.BOLD);
@@ -4601,7 +4610,7 @@ public class HomeActivity extends AppCompatActivity {
         root.addView(title);
 
         final TextView tvCurrentVer = new TextView(this);
-        tvCurrentVer.setText("Installed Version: v" + getInstalledVersionLabel() + " (Build #" + getInstalledBuildNumber() + ")");
+        tvCurrentVer.setText("v" + getInstalledVersionLabel() + "  •  Build #" + getInstalledBuildNumber());
         tvCurrentVer.setTextColor(Color.parseColor("#94A3B8"));
         tvCurrentVer.setTextSize(12f);
         tvCurrentVer.setPadding(0, 0, 0, dpToPx(12));
@@ -4621,14 +4630,14 @@ public class HomeActivity extends AppCompatActivity {
         statusCard.setBackground(scBg);
 
         final TextView tvStatusTitle = new TextView(this);
-        tvStatusTitle.setText("🔍 Checking for updates...");
+        tvStatusTitle.setText("Checking for updates…");
         tvStatusTitle.setTextColor(Color.parseColor("#00E5FF"));
         tvStatusTitle.setTextSize(13.5f);
         tvStatusTitle.setTypeface(modernFont, Typeface.BOLD);
         statusCard.addView(tvStatusTitle);
 
         final TextView tvStatusNotes = new TextView(this);
-        tvStatusNotes.setText("Connecting to GitHub Release server...");
+        tvStatusNotes.setText("Contacting GitHub…");
         tvStatusNotes.setTextColor(Color.parseColor("#CBD5E1"));
         tvStatusNotes.setTextSize(11.5f);
         tvStatusNotes.setPadding(0, dpToPx(4), 0, 0);
@@ -4636,15 +4645,27 @@ public class HomeActivity extends AppCompatActivity {
 
         root.addView(statusCard);
 
-        TextView repoLabel = new TextView(this);
-        repoLabel.setText("GitHub Repo (owner/repo) or Direct APK URL:");
-        repoLabel.setTextColor(Color.parseColor("#94A3B8"));
-        repoLabel.setTextSize(11f);
-        repoLabel.setPadding(0, 0, 0, dpToPx(4));
-        root.addView(repoLabel);
+        // আপডেট সোর্স: ডিফল্টে লুকানো — বেশিরভাগ সময় দেখার দরকার নেই,
+        // ট্যাপ করলে বদলানোর বক্স খুলবে
+        final TextView sourceRow = new TextView(this);
+        sourceRow.setText("Source: " + getConfiguredGithubRepo() + "  ▾");
+        sourceRow.setTextColor(Color.parseColor("#94A3B8"));
+        sourceRow.setTextSize(12f);
+        sourceRow.setPadding(0, dpToPx(2), 0, dpToPx(6));
+        root.addView(sourceRow);
 
-        final EditText inputRepo = createStyledEditText("e.g. username/ProStrem or https://.../ProStream.apk", getConfiguredGithubRepo(), false);
-        root.addView(inputRepo);
+        final LinearLayout sourceBox = new LinearLayout(this);
+        sourceBox.setOrientation(LinearLayout.VERTICAL);
+        sourceBox.setVisibility(View.GONE);
+        final EditText inputRepo = createStyledEditText("owner/repo or APK link", getConfiguredGithubRepo(), false);
+        sourceBox.addView(inputRepo);
+        root.addView(sourceBox);
+
+        sourceRow.setOnClickListener(v -> {
+            boolean show = sourceBox.getVisibility() != View.VISIBLE;
+            sourceBox.setVisibility(show ? View.VISIBLE : View.GONE);
+            sourceRow.setText("Source: " + getConfiguredGithubRepo() + (show ? "  ▴" : "  ▾"));
+        });
 
         builder.setView(root);
         final AlertDialog dialog = builder.create();
@@ -4685,25 +4706,30 @@ public class HomeActivity extends AppCompatActivity {
                 sharedPrefs.edit().putString("UPDATE_GITHUB_REPO", entered).apply();
             }
             final String targetRepoOrUrl = entered.isEmpty() ? getConfiguredGithubRepo() : entered;
-            tvStatusTitle.setText("🔍 Checking for updates...");
+            tvStatusTitle.setText("Checking for updates…");
             tvStatusTitle.setTextColor(Color.parseColor("#00E5FF"));
-            tvStatusNotes.setText("Source: " + targetRepoOrUrl);
+            tvStatusNotes.setText("Contacting GitHub…");
+            sourceRow.setText("Source: " + targetRepoOrUrl + (sourceBox.getVisibility() == View.VISIBLE ? "  ▴" : "  ▾"));
 
             bgExecutor.execute(() -> {
                 try {
                     if (targetRepoOrUrl.startsWith("http") && targetRepoOrUrl.toLowerCase(Locale.ROOT).endsWith(".apk")) {
                         latestDownloadUrlHolder[0] = targetRepoOrUrl;
                         mainHandler.post(() -> {
-                            tvStatusTitle.setText("✓ Direct APK Link Ready");
+                            tvStatusTitle.setText("APK link ready");
                             tvStatusTitle.setTextColor(Color.parseColor("#00F5A0"));
-                            tvStatusNotes.setText("Tap 'Update Now' to download and install the latest APK directly inside ProStream.");
+                            tvStatusNotes.setText("Tap Update Now to install.");
                         });
                         return;
                     }
 
                     String apiUrl = "https://api.github.com/repos/" + targetRepoOrUrl + "/releases/latest";
+                    // হেডার এখানে বদলানো যাবে না: openBrowserLikeConnectionWithRedirects
+                    // ইতিমধ্যে getResponseCode() ডেকে কানেকশন করে ফেলেছে, আর কানেক্টেড
+                    // কানেকশনে setRequestProperty করলে IllegalStateException হয় — এই
+                    // এক লাইনের কারণেই Check Now সবসময় ব্যর্থ হতো। হেলপার ইতিমধ্যে
+                    // Accept: */* পাঠায়, GitHub তাতে JSON-ই দেয়।
                     HttpURLConnection conn = openBrowserLikeConnectionWithRedirects(apiUrl, "https://github.com/" + targetRepoOrUrl, null);
-                    conn.setRequestProperty("Accept", "application/vnd.github+json");
                     int code = conn.getResponseCode();
 
                     if (code >= 200 && code < 300) {
@@ -4749,31 +4775,34 @@ public class HomeActivity extends AppCompatActivity {
                         final int finalRemoteBuild = remoteBuildNum;
                         final String sizeLabel = apkSize > 0 ? (" • " + formatBytesStatic(apkSize)) : "";
 
+                        final String shortNotes = firstLineOrDefault(bodyNotes, 140);
                         mainHandler.post(() -> {
                             if (finalRemoteBuild > getInstalledBuildNumber()) {
-                                tvStatusTitle.setText("🔥 New Update Available: " + relTitle + sizeLabel);
+                                tvStatusTitle.setText("New update available: " + relTitle + sizeLabel);
                                 tvStatusTitle.setTextColor(Color.parseColor("#00F5A0"));
-                                tvStatusNotes.setText(bodyNotes + "\n\nTap 'Update Now' to install directly.");
+                                tvStatusNotes.setText(shortNotes);
                             } else {
-                                tvStatusTitle.setText("✓ You have the latest version (" + tagName + sizeLabel + ")");
+                                tvStatusTitle.setText("✓ You're up to date (" + tagName + sizeLabel + ")");
                                 tvStatusTitle.setTextColor(Color.parseColor("#00F5A0"));
-                                tvStatusNotes.setText("You can still tap 'Update Now' anytime to reinstall or force-update from the latest GitHub release.");
+                                tvStatusNotes.setText("Latest version installed.");
                             }
                         });
                     } else {
                         conn.disconnect();
                         latestDownloadUrlHolder[0] = "https://github.com/" + targetRepoOrUrl + "/releases/latest/download/ProStream.apk";
                         mainHandler.post(() -> {
-                            tvStatusTitle.setText("ℹ️ Ready via Direct Release Link");
+                            tvStatusTitle.setText("Couldn't verify version");
                             tvStatusTitle.setTextColor(Color.parseColor("#FDE047"));
-                            tvStatusNotes.setText("Enter your GitHub repo (username/repo) above and tap 'Update Now' to fetch ProStream.apk.");
+                            tvStatusNotes.setText("Tap Update Now to install the latest release.");
                         });
                     }
                 } catch (Exception e) {
+                    // API-তে পৌঁছানো না গেলেও সরাসরি রিলিজ লিংক দিয়ে Update Now কাজ করবে
+                    latestDownloadUrlHolder[0] = "https://github.com/" + targetRepoOrUrl + "/releases/latest/download/ProStream.apk";
                     mainHandler.post(() -> {
-                        tvStatusTitle.setText("⚠️ Could not reach update server");
+                        tvStatusTitle.setText("⚠️ Couldn't check for updates");
                         tvStatusTitle.setTextColor(Color.parseColor("#FDA4AF"));
-                        tvStatusNotes.setText("Check your internet connection or verify your GitHub repo name above.");
+                        tvStatusNotes.setText("Check your connection and try again — or tap Update Now.");
                     });
                 }
             });
@@ -4821,8 +4850,10 @@ public class HomeActivity extends AppCompatActivity {
             try {
                 if (repoOrUrl.startsWith("http")) return;
                 String apiUrl = "https://api.github.com/repos/" + repoOrUrl + "/releases/latest";
+                // হেডার এখানে বদলানো যাবে না (উপরে দেখো): কানেক্টেড কানেকশনে
+                // setRequestProperty করলে IllegalStateException হয় — এই এক লাইনের
+                // কারণেই অটো-আপডেট পপআপ কখনো আসত না।
                 HttpURLConnection conn = openBrowserLikeConnectionWithRedirects(apiUrl, "https://github.com/" + repoOrUrl, null);
-                conn.setRequestProperty("Accept", "application/vnd.github+json");
                 int code = conn.getResponseCode();
                 if (code < 200 || code >= 300) {
                     conn.disconnect();
