@@ -177,6 +177,7 @@ public class HomeActivity extends AppCompatActivity {
     };
 
     private volatile boolean videoDetectedToastShownForPage = false;
+    private String lastLoadedSitesJson = null;
 
     private static Context appContextRef;
     private static WifiManager.WifiLock turboWifiLock;
@@ -6236,6 +6237,7 @@ public class HomeActivity extends AppCompatActivity {
         if (modernOfflineOverlay != null && modernOfflineOverlay.getVisibility() == View.VISIBLE && isNetworkAvailable()) {
             reloadActivePageCleanly();
         }
+        reloadSitesIfChanged();
     }
 
     @Override
@@ -6388,6 +6390,47 @@ public class HomeActivity extends AppCompatActivity {
         if (currentSite == null && !siteList.isEmpty()) {
             switchToSiteInstantInternal(siteList.get(0), false, false);
         }
+    }
+
+    private void reloadSitesIfChanged() {
+        String currentJson = sharedPrefs.getString("SITES_JSON", "");
+        if (lastLoadedSitesJson == null) {
+            lastLoadedSitesJson = currentJson;
+            return;
+        }
+        if (currentJson.equals(lastLoadedSitesJson)) return;
+        lastLoadedSitesJson = currentJson;
+        String currentUrl = currentSite != null ? currentSite.url : null;
+        loadCustomLinksAndPreloadAll();
+        boolean currentStillExists = false;
+        if (currentUrl != null) {
+            for (SiteItem s : siteList) {
+                if (s.url.equalsIgnoreCase(currentUrl)) {
+                    currentStillExists = true;
+                    break;
+                }
+            }
+        }
+        if (!currentStillExists && !siteList.isEmpty()) {
+            switchToSiteInstantInternal(siteList.get(0), false, false);
+        } else {
+            updateUIForCurrentSite();
+        }
+        try {
+            Set<String> keepUrls = new HashSet<>();
+            for (SiteItem s : siteList) keepUrls.add(s.url);
+            ArrayList<String> deadUrls = new ArrayList<>();
+            for (String url : webViewPool.keySet()) {
+                if (!keepUrls.contains(url)) deadUrls.add(url);
+            }
+            for (String url : deadUrls) {
+                WebView dead = webViewPool.remove(url);
+                if (dead != null) {
+                    try { webViewHolder.removeView(dead); } catch (Exception ignored) {}
+                    try { dead.stopLoading(); dead.destroy(); } catch (Exception ignored) {}
+                }
+            }
+        } catch (Exception ignored) {}
     }
 
     private void updateUIForCurrentSite() {

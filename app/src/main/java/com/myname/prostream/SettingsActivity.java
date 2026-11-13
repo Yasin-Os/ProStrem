@@ -174,8 +174,10 @@ public class SettingsActivity extends AppCompatActivity {
 
     // S3: Settings থেকে আপডেট চেক — HomeActivity-তে OPEN_UPDATE_DIALOG পাঠানো হয়
     private void addUpdateRow() {
-        if (cardGroup1 == null || !(cardGroup1.getChildAt(0) instanceof ViewGroup)) return;
-        ViewGroup inner = (ViewGroup) cardGroup1.getChildAt(0);
+        if (!(cardGroup1 instanceof ViewGroup)) return;
+        ViewGroup group = (ViewGroup) cardGroup1;
+        if (group.getChildCount() == 0 || !(group.getChildAt(0) instanceof ViewGroup)) return;
+        ViewGroup inner = (ViewGroup) group.getChildAt(0);
 
         View divider = new View(this);
         LinearLayout.LayoutParams divLp = new LinearLayout.LayoutParams(
