@@ -1,6 +1,7 @@
 build/
 .gradle/
-.platform/
+.platform/*
+!.platform/workspace.json
 local.properties
 *.apk
 *.aab
