@@ -18,8 +18,10 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
+import android.content.pm.PackageInfo;
 import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
+import android.content.pm.Signature;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -219,12 +221,24 @@ public class HomeActivity extends AppCompatActivity {
         if (lower.contains("cloudflare") || lower.contains("turnstile") || lower.contains("cdn-cgi")) {
             return false;
         }
+        // হোস্ট-ভিত্তিক ম্যাচ: URL-এর যেকোনো জায়গায় ডোমেইন নাম থাকলেই ব্লক নয়,
+        // শুধু আসল হোস্ট মিললে ব্লক হয় (ভুল ব্লক কমে)
+        String host = extractHost(lower);
+        if (host == null) return false;
         for (String domain : BLOCKED_AD_DOMAINS) {
-            if (lower.contains(domain)) {
+            if (host.equals(domain) || host.endsWith("." + domain)) {
                 return true;
             }
         }
         return false;
+    }
+
+    private static String extractHost(String url) {
+        try {
+            return Uri.parse(url).getHost();
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private View rootLayout;
@@ -2107,7 +2121,7 @@ public class HomeActivity extends AppCompatActivity {
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
         s.setMediaPlaybackRequiresUserGesture(false);
-        s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+        s.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
         s.setUserAgentString(browserUserAgent);
 
         CookieManager.getInstance().setAcceptThirdPartyCookies(snifferWv, true);
@@ -3701,10 +3715,10 @@ public class HomeActivity extends AppCompatActivity {
         settings.setDomStorageEnabled(true);
         settings.setDatabaseEnabled(true);
         settings.setCacheMode(WebSettings.LOAD_DEFAULT);
-        settings.setAllowFileAccess(true);
+        settings.setAllowFileAccess(false);
         settings.setAllowContentAccess(true);
         settings.setMediaPlaybackRequiresUserGesture(false);
-        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
         settings.setLoadWithOverviewMode(true);
         settings.setUseWideViewPort(true);
         settings.setSupportZoom(true);
@@ -3855,9 +3869,12 @@ public class HomeActivity extends AppCompatActivity {
 
             @Override
             public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
+                // নিরাপত্তা: সার্টিফিকেট এরর থাকলে পেজ লোড বন্ধ করা হয় — proceed করা হয় না
                 if (handler != null) {
-                    handler.proceed();
+                    handler.cancel();
                 }
+                Toast.makeText(HomeActivity.this,
+                        "নিরাপদ সংযোগ যাচাই করা যায়নি — পেজটি খোলা হয়নি।", Toast.LENGTH_LONG).show();
             }
 
             @Override
@@ -3952,16 +3969,42 @@ public class HomeActivity extends AppCompatActivity {
             public void onPermissionRequest(final PermissionRequest request) {
                 runOnUiThread(() -> {
                     try {
-                        request.grant(request.getResources());
+                        final String[] resources = request.getResources();
+                        String origin = request.getOrigin() != null ? request.getOrigin().toString() : "";
+                        StringBuilder names = new StringBuilder();
+                        for (String res : resources) {
+                            if (names.length() > 0) names.append(", ");
+                            if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(res)) names.append("ক্যামেরা");
+                            else if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(res)) names.append("মাইক্রোফোন");
+                            else names.append(res);
+                        }
+                        new AlertDialog.Builder(HomeActivity.this)
+                                .setTitle("অনুমতি চাইছে")
+                                .setMessage(origin + "\n\nএই সাইটটি ব্যবহার করতে চায়: " + names)
+                                .setPositiveButton("অনুমতি দিন", (d, w) -> {
+                                    try { request.grant(resources); } catch (Exception ignored) {}
+                                })
+                                .setNegativeButton("দেবো না", (d, w) -> {
+                                    try { request.deny(); } catch (Exception ignored) {}
+                                })
+                                .setOnCancelListener(d -> {
+                                    try { request.deny(); } catch (Exception ignored) {}
+                                })
+                                .show();
                     } catch (Exception ignored) {}
                 });
             }
 
             @Override
             public void onGeolocationPermissionsShowPrompt(String origin, GeolocationPermissions.Callback callback) {
-                if (callback != null) {
-                    callback.invoke(origin, true, true);
-                }
+                if (callback == null) return;
+                new AlertDialog.Builder(HomeActivity.this)
+                        .setTitle("লোকেশন চাইছে")
+                        .setMessage(origin + "\n\nএই সাইটটি আপনার লোকেশন জানতে চায়।")
+                        .setPositiveButton("অনুমতি দিন", (d, w) -> callback.invoke(origin, true, false))
+                        .setNegativeButton("দেবো না", (d, w) -> callback.invoke(origin, false, false))
+                        .setOnCancelListener(d -> callback.invoke(origin, false, false))
+                        .show();
             }
 
             @Override
@@ -4362,7 +4405,6 @@ public class HomeActivity extends AppCompatActivity {
 
         int lockType = sharedPrefs.getInt("LOCK_TYPE", 1);
         boolean useBio = sharedPrefs.getBoolean("USE_BIOMETRIC", true);
-        String currentPin = sharedPrefs.getString("APP_PASSWORD", "1234");
 
         final RadioGroup rg = new RadioGroup(this);
         rg.setOrientation(RadioGroup.VERTICAL);
@@ -4383,7 +4425,8 @@ public class HomeActivity extends AppCompatActivity {
         else rbPin.setChecked(true);
         root.addView(rg);
 
-        final EditText inputPin = createStyledEditText("PIN", currentPin, false);
+        // PIN প্লেইনটেক্সটে দেখানো হয় না — বদলাতে চাইলে নতুন PIN লিখতে হবে
+        final EditText inputPin = createStyledEditText("PIN", "", false);
         root.addView(inputPin);
 
         final CheckBox cbBio = new CheckBox(this);
@@ -4421,10 +4464,11 @@ public class HomeActivity extends AppCompatActivity {
             } else {
                 String pin = inputPin.getText().toString().trim();
                 if (pin.isEmpty()) {
+                    Toast.makeText(HomeActivity.this, "PIN খালি রাখা যাবে না!", Toast.LENGTH_SHORT).show();
                     return;
                 }
                 editor.putInt("LOCK_TYPE", 1);
-                editor.putString("APP_PASSWORD", pin);
+                AppUtil.savePin(sharedPrefs, pin);
             }
             editor.putBoolean("USE_BIOMETRIC", cbBio.isChecked());
             editor.apply();
@@ -4455,7 +4499,7 @@ public class HomeActivity extends AppCompatActivity {
                 }
             }
         } catch (Exception ignored) {}
-        return "YasinAdnan/ProStrem";
+        return "Yasin-Os/ProStrem";
     }
 
     private String normalizeGithubRepoInput(String raw) {
@@ -4731,7 +4775,7 @@ public class HomeActivity extends AppCompatActivity {
 
     private void checkForAppUpdateInBackground(final boolean showToastIfUpToDate) {
         final String repoOrUrl = getConfiguredGithubRepo();
-        if (repoOrUrl.isEmpty() || repoOrUrl.equalsIgnoreCase("YasinAdnan/ProStrem")) {
+        if (repoOrUrl.isEmpty()) {
             return;
         }
         bgExecutor.execute(() -> {
@@ -4981,8 +5025,46 @@ public class HomeActivity extends AppCompatActivity {
         });
     }
 
+    /** আপডেট APK ইনস্টলের আগে যাচাই: একই প্যাকেজ নাম + একই সাইনিং সার্টিফিকেট হতে হবে। */
+    private boolean isValidUpdateApk(File apkFile) {
+        if (apkFile == null || !apkFile.exists() || apkFile.length() == 0) return false;
+        try {
+            PackageManager pm = getPackageManager();
+            int flags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                    ? PackageManager.GET_SIGNING_CERTIFICATES
+                    : PackageManager.GET_SIGNATURES;
+            PackageInfo apkInfo = pm.getPackageArchiveInfo(apkFile.getAbsolutePath(), flags);
+            if (apkInfo == null || !getPackageName().equals(apkInfo.packageName)) return false;
+            PackageInfo installed = pm.getPackageInfo(getPackageName(), flags);
+            if (installed == null) return false;
+            Signature[] apkSigs = getApkSignatures(apkInfo);
+            Signature[] installedSigs = getApkSignatures(installed);
+            if (apkSigs == null || installedSigs == null || apkSigs.length != installedSigs.length) return false;
+            for (int i = 0; i < apkSigs.length; i++) {
+                if (!apkSigs[i].equals(installedSigs[i])) return false;
+            }
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static Signature[] getApkSignatures(PackageInfo info) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            if (info.signingInfo == null) return null;
+            return info.signingInfo.getApkContentsSigners();
+        } else {
+            return info.signatures;
+        }
+    }
+
     private void installDownloadedUpdateApk(File apkFile) {
         if (apkFile == null || !apkFile.exists()) return;
+        if (!isValidUpdateApk(apkFile)) {
+            try { apkFile.delete(); } catch (Exception ignored) {}
+            Toast.makeText(this, "Update APK যাচাই করা যায়নি — ইনস্টল বন্ধ করা হয়েছে।", Toast.LENGTH_LONG).show();
+            return;
+        }
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 if (!getPackageManager().canRequestPackageInstalls()) {

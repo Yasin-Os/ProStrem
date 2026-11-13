@@ -1,5 +1,6 @@
 build/
 .gradle/
+.platform/
 local.properties
 *.apk
 *.aab

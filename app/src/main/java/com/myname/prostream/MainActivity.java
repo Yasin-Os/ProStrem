@@ -43,6 +43,7 @@ public class MainActivity extends AppCompatActivity {
     private TextView tvTypoAppName, tvTypoDeveloper, tvLockSubtitle;
     private EditText passwordInput;
     private MaterialButton loginButton;
+    private ObjectAnimator logoPulseAnimator;
     private final Handler typoHandler = new Handler(Looper.getMainLooper());
 
     @Override
@@ -58,7 +59,8 @@ public class MainActivity extends AppCompatActivity {
         final int lockType = sharedPrefs.getInt("LOCK_TYPE", 1);
 
         // যদি লক বন্ধ থাকে এবং HomeActivity ইতিমধ্যে সচল থাকে, তবে রিলোড ছাড়াই সরাসরি আগের পেজে নিয়ে যাবে
-        if (lockType == 0 && HomeActivity.isSessionAlive()) {
+        // PIN কখনো সেট করা না হয়ে থাকলে (নতুন ইনস্টল) লক স্ক্রিন দেখিয়ে আটকে রাখা যাবে না
+        if ((lockType == 0 || !AppUtil.hasPin(sharedPrefs)) && HomeActivity.isSessionAlive()) {
             goToHome();
             return;
         }
@@ -101,7 +103,7 @@ public class MainActivity extends AppCompatActivity {
 
         typoHandler.postDelayed(() -> {
             if (isFinishing()) return;
-            if (lockType == 0) {
+            if (lockType == 0 || !AppUtil.hasPin(sharedPrefs)) {
                 goToHome();
             } else {
                 revealLockScreenSmoothly();
@@ -111,8 +113,12 @@ public class MainActivity extends AppCompatActivity {
         if (loginButton != null) {
             loginButton.setOnClickListener(v -> {
                 String inputPassword = passwordInput != null ? passwordInput.getText().toString().trim() : "";
-                String savedPassword = sharedPrefs.getString("APP_PASSWORD", "1234");
-                if (inputPassword.equals(savedPassword)) {
+                if (AppUtil.isPinLockedOut(sharedPrefs)) {
+                    long secs = AppUtil.pinLockoutRemainingMs(sharedPrefs) / 1000 + 1;
+                    Toast.makeText(MainActivity.this, "অনেক ভুল চেষ্টা! " + secs + " সেকেন্ড পরে আবার চেষ্টা করুন।", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                if (AppUtil.verifyPin(sharedPrefs, inputPassword)) {
                     goToHome();
                 } else {
                     if (loginCard != null) {
@@ -120,7 +126,11 @@ public class MainActivity extends AppCompatActivity {
                                 loginCard.animate().translationX(-20f).setDuration(55).withEndAction(() ->
                                         loginCard.animate().translationX(0f).setDuration(55).start()).start()).start();
                     }
-                    Toast.makeText(MainActivity.this, "Incorrect PIN / Password!", Toast.LENGTH_SHORT).show();
+                    int left = AppUtil.pinFailuresLeft(sharedPrefs);
+                    String msg = left > 0
+                            ? "Incorrect PIN / Password! (" + left + " attempts left)"
+                            : "Incorrect PIN / Password! Locked out for a while.";
+                    Toast.makeText(MainActivity.this, msg, Toast.LENGTH_SHORT).show();
                 }
             });
         }
@@ -183,6 +193,7 @@ public class MainActivity extends AppCompatActivity {
             pulse.setStartDelay(550);
             pulse.setRepeatCount(ValueAnimator.INFINITE);
             pulse.start();
+            logoPulseAnimator = pulse;
         }
 
         final String brandTitle = "ProStream";
@@ -342,6 +353,7 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
+        if (logoPulseAnimator != null) logoPulseAnimator.cancel();
         typoHandler.removeCallbacksAndMessages(null);
         super.onDestroy();
     }

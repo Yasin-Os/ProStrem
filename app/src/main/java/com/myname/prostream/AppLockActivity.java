@@ -47,7 +47,6 @@ public class AppLockActivity extends AppCompatActivity {
         toolbarAppLock.setNavigationOnClickListener(v -> finish());
 
         int currentType = prefs.getInt("LOCK_TYPE", 1);
-        String savedPass = prefs.getString("APP_PASSWORD", "1234");
         boolean useBio = prefs.getBoolean("USE_BIOMETRIC", true);
 
         if (currentType == 0) {
@@ -58,7 +57,7 @@ public class AppLockActivity extends AppCompatActivity {
             passwordSection.setVisibility(View.VISIBLE);
         }
 
-        editNewPassword.setText(savedPass);
+        // PIN কখনো প্লেইনটেক্সটে দেখানো হয় না — নতুন PIN লিখে সেভ করলে হ্যাশ হিসেবে সংরক্ষিত হয়
         switchFingerprint.setChecked(useBio);
 
         lockTypeGroup.setOnCheckedChangeListener((group, checkedId) -> {
@@ -78,9 +77,11 @@ public class AppLockActivity extends AppCompatActivity {
                 return;
             }
 
+            if (selectedType == 1) {
+                AppUtil.savePin(prefs, pass);
+            }
             prefs.edit()
                     .putInt("LOCK_TYPE", selectedType)
-                    .putString("APP_PASSWORD", pass)
                     .putBoolean("USE_BIOMETRIC", switchFingerprint.isChecked())
                     .apply();
 
@@ -93,7 +94,7 @@ public class AppLockActivity extends AppCompatActivity {
 
     private void applyThemeColor() {
         String hex = prefs.getString("APP_COLOR", "#0D9488");
-        int color = Color.parseColor(hex);
+        int color = AppUtil.parseColorSafe(hex, Color.parseColor("#0D9488"));
 
         getWindow().setStatusBarColor(color);
         toolbarAppLock.setTitleTextColor(color);

@@ -42,7 +42,7 @@ public class InterfaceActivity extends AppCompatActivity {
         toolbarInterface.setNavigationOnClickListener(v -> finish());
 
         String currentColorHex = prefs.getString("APP_COLOR", "#0D9488");
-        int parsed = Color.parseColor(currentColorHex);
+        int parsed = AppUtil.parseColorSafe(currentColorHex, Color.parseColor("#0D9488"));
         r = Color.red(parsed);
         g = Color.green(parsed);
         b = Color.blue(parsed);
@@ -76,7 +76,8 @@ public class InterfaceActivity extends AppCompatActivity {
             Toast.makeText(this, "থিম কালার সফলভাবে সংরক্ষিত!", Toast.LENGTH_SHORT).show();
         });
 
-        boolean isDark = prefs.getBoolean("DARK_MODE", true);
+        // HomeActivity-র সঙ্গে ডিফল্ট মিল রাখা হয়েছে (false) — আগে এখানে true ছিল
+        boolean isDark = prefs.getBoolean("DARK_MODE", false);
         switchDarkMode.setChecked(isDark);
         switchDarkMode.setOnCheckedChangeListener((btn, checked) -> {
             prefs.edit().putBoolean("DARK_MODE", checked).apply();
@@ -94,7 +95,7 @@ public class InterfaceActivity extends AppCompatActivity {
 
     private void applyThemeUI() {
         String hex = prefs.getString("APP_COLOR", "#0D9488");
-        int color = Color.parseColor(hex);
+        int color = AppUtil.parseColorSafe(hex, Color.parseColor("#0D9488"));
 
         getWindow().setStatusBarColor(color);
         btnApplyCustomColor.setBackgroundTintList(ColorStateList.valueOf(color));
