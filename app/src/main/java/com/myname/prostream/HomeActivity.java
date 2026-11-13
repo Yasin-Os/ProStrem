@@ -215,6 +215,10 @@ public class HomeActivity extends AppCompatActivity {
             "bet365.com", "1xbet.com", "melbet.com", "mostbet.com"
     };
 
+    // অ্যাড-ব্লক সিদ্ধান্তের ক্যাশ: প্রত্যেক সাব-রিসোর্সে Uri.parse + ৩০ ডোমেইন
+    // লুপ না চালিয়ে হোস্ট অনুযায়ী আগের সিদ্ধান্ত ব্যবহার করা হয়
+    private static final LruCache<String, Boolean> adBlockHostCache = new LruCache<>(256);
+
     private static boolean isBlockedAdUrl(String url) {
         if (url == null || url.isEmpty()) return false;
         String lower = url.toLowerCase(Locale.ROOT);
@@ -225,11 +229,15 @@ public class HomeActivity extends AppCompatActivity {
         // শুধু আসল হোস্ট মিললে ব্লক হয় (ভুল ব্লক কমে)
         String host = extractHost(lower);
         if (host == null) return false;
+        Boolean cached = adBlockHostCache.get(host);
+        if (cached != null) return cached;
         for (String domain : BLOCKED_AD_DOMAINS) {
             if (host.equals(domain) || host.endsWith("." + domain)) {
+                adBlockHostCache.put(host, Boolean.TRUE);
                 return true;
             }
         }
+        adBlockHostCache.put(host, Boolean.FALSE);
         return false;
     }
 
@@ -1221,9 +1229,10 @@ public class HomeActivity extends AppCompatActivity {
                     try {
                         WebView bgWv = (WebView) child;
                         bgWv.evaluateJavascript("(function(){var m=document.querySelectorAll('video,audio');for(var i=0;i<m.length;i++){try{m[i].pause();}catch(e){}}})();", null);
-                        if (batterySaverEnabled) {
-                            bgWv.onPause();
-                        }
+                        // ব্যাকগ্রাউন্ডের WebView সবসময় থামানো হয় — না হলে ওগুলোর
+                        // JS/বিজ্ঞাপন চলমান ভিডিওর CPU ও ব্যান্ডউইথ খেয়ে নেয়।
+                        // সাইটে ফিরলে onResume()+resumeTimers() দিয়ে আবার চালু হয়।
+                        bgWv.onPause();
                     } catch (Exception ignored) {}
                 }
             }
@@ -1262,7 +1271,10 @@ public class HomeActivity extends AppCompatActivity {
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             try {
-                webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false);
+                // BOUND: রেন্ডারার অ্যাপের সঙ্গে foreground প্রায়োরিটি পায় — ভিডিও
+                // চলাকালীন সিস্টেম রেন্ডারারকে থ্রটল/কিল করতে পারে না; লুকানো
+                // WebView-এ প্রায়োরিটি ছেড়ে দেওয়া হয় (waived = true)।
+                webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_BOUND, true);
             } catch (Exception ignored) {}
         }
         if (darkModeEnabled) {
@@ -2143,7 +2155,10 @@ public class HomeActivity extends AppCompatActivity {
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
         s.setMediaPlaybackRequiresUserGesture(false);
-        s.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
+        // COMPATIBILITY_MODE: http ভিডিও/অডিও/ছবি (optionally-blockable) লোড হতে দেয়,
+        // স্ক্রিপ্টের মতো active mixed content ব্লক করে। NEVER_ALLOW http ভিডিও
+        // আটকে দিত — স্ট্রিমিং ব্রাউজারের জন্য এটাই সঠিক।
+        s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
         s.setUserAgentString(browserUserAgent);
 
         CookieManager.getInstance().setAcceptThirdPartyCookies(snifferWv, true);
@@ -3728,7 +3743,7 @@ public class HomeActivity extends AppCompatActivity {
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             try {
-                wv.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false);
+                wv.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_BOUND, true);
             } catch (Exception ignored) {}
         }
 
@@ -3740,7 +3755,9 @@ public class HomeActivity extends AppCompatActivity {
         settings.setAllowFileAccess(false);
         settings.setAllowContentAccess(true);
         settings.setMediaPlaybackRequiresUserGesture(false);
-        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
+        // COMPATIBILITY_MODE: http ভিডিও/অডিও/ছবি লোড হতে দেয়, active mixed
+        // content (স্ক্রিপ্ট) ব্লক করে। NEVER_ALLOW https পেজে http ভিডিও আটকে দিত।
+        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
         settings.setLoadWithOverviewMode(true);
         settings.setUseWideViewPort(true);
         settings.setSupportZoom(true);
@@ -5904,10 +5921,9 @@ public class HomeActivity extends AppCompatActivity {
             saveSitesToPrefs();
         }
 
-        for (SiteItem s : siteList) {
-            preloadSiteOgBitmapInBackground(s);
-        }
-
+        // স্টার্টআপে সব সাইটের OG ছবি আগে থেকে নামানো হয় না — হাল্কা নেটে এগুলো
+        // (প্রত্যেক সাইটের হোমপেজ HTML + ছবি) ভিডিওর ব্যান্ডউইথ খেয়ে নিত।
+        // সুইচার/হাব খুললে loadSiteOgPhotoAsync দরকারমতো (ডিস্ক ক্যাশ → ডাউনলোড) লোড করে।
         if (currentSite == null && !siteList.isEmpty()) {
             switchToSiteInstantInternal(siteList.get(0), false, false);
         }
