@@ -298,6 +298,9 @@ public class HomeActivity extends AppCompatActivity {
     private long lastSslToastTimeMs = 0;
     private String lastMainFrameNavUrl = null;
     private boolean lastMainFrameFailedSsl = false;
+    // রেন্ডারার ক্র্যাশের হিসাব: একই পেজ ৬০ সেকেন্ডে ৩ বার মরলে আর রিলোড নয়
+    private int renderCrashCount = 0;
+    private long firstRenderCrashTimeMs = 0;
     private final Set<WebView> clearHistoryOnLoadSet = Collections.synchronizedSet(new HashSet<>());
     private final Set<String> fetchingOgUrls = Collections.synchronizedSet(new HashSet<>());
 
@@ -755,6 +758,18 @@ public class HomeActivity extends AppCompatActivity {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == 701) {
             showFirstRunGuideIfNeeded();
+        } else if (requestCode == 702) {
+            boolean allGranted = grantResults != null && grantResults.length > 0;
+            if (grantResults != null) {
+                for (int r : grantResults) {
+                    if (r != PackageManager.PERMISSION_GRANTED) { allGranted = false; break; }
+                }
+            }
+            if (allGranted) {
+                Toast.makeText(this, "অনুমতি দেওয়া হয়েছে — সাইটে আবার চেষ্টা করুন।", Toast.LENGTH_LONG).show();
+            } else {
+                Toast.makeText(this, "অনুমতি না দিলে সাইটের ক্যামেরা/মাইক/লোকেশন কাজ করবে না। Settings → App Permissions থেকে চালু করা যাবে।", Toast.LENGTH_LONG).show();
+            }
         }
     }
 
@@ -1543,6 +1558,7 @@ public class HomeActivity extends AppCompatActivity {
 
     private void showAnimatedDialog(final AlertDialog dialog, final View rootCard) {
         if (dialog == null) return;
+        if (isFinishing()) return;
         forceEnableAnimations();
         if (rootCard != null) {
             rootCard.setAlpha(0f);
@@ -4056,8 +4072,17 @@ public class HomeActivity extends AppCompatActivity {
                     webViewHolder.removeView(oldWv);
                     oldWv.destroy();
                 }
+                lastFailedUrlMap.remove(oldWv);
+                clearHistoryOnLoadSet.remove(oldWv);
                 saveSitesToPrefs();
-                dismissPopupWithAnimation(dialog, root, () -> switchToSiteInstant(siteList.get(0), false));
+                // মুছা সাইটটাই চালু ছিল শুধু তখনই প্রথম সাইটে যাওয়া হয় —
+                // ব্যাকগ্রাউন্ডের সাইট মুছলে চালু ভিডিও/পেজেই থাকা হয়
+                boolean deletedCurrent = currentSite != null && currentSite.url.equalsIgnoreCase(removed.url);
+                if (deletedCurrent) {
+                    dismissPopupWithAnimation(dialog, root, () -> switchToSiteInstant(siteList.get(0), false));
+                } else {
+                    dismissPopupWithAnimation(dialog, root, null);
+                }
             });
             btnRow.addView(btnDelete);
         }
@@ -4391,11 +4416,27 @@ public class HomeActivity extends AppCompatActivity {
                         if (webViewHolder != null) {
                             webViewHolder.removeView(view);
                         }
+                        lastFailedUrlMap.remove(view);
+                        clearHistoryOnLoadSet.remove(view);
                         view.destroy();
                     }
-                    if (currentSite != null) {
-                        mainHandler.postDelayed(() -> switchToSiteInstantInternal(currentSite, true, false), 150);
+                    // ব্যাকগ্রাউন্ডের WebView মরলে শুধু সেটা সরিয়ে দেওয়া হয় —
+                    // সামনের পেজে হাত দেওয়া হয় না, স্ক্রল/ফর্ম হারায় না
+                    if (view != webView || currentSite == null) return true;
+                    long now = SystemClock.elapsedRealtime();
+                    if (now - firstRenderCrashTimeMs > 60000) {
+                        renderCrashCount = 0;
+                        firstRenderCrashTimeMs = now;
                     }
+                    renderCrashCount++;
+                    if (renderCrashCount >= 3) {
+                        // একই পেজ বারবার ক্র্যাশ করছে — অনন্ত রিলোড লুপ নয়, এরর স্ক্রিন
+                        if (swipeRefresh != null) swipeRefresh.setRefreshing(false);
+                        if (progressBar != null) progressBar.setVisibility(View.GONE);
+                        showModernOfflineScreen(currentSite.getEffectiveUrl(), "পেজটি বারবার বন্ধ হয়ে যাচ্ছে");
+                        return true;
+                    }
+                    mainHandler.postDelayed(() -> switchToSiteInstantInternal(currentSite, true, false), 150);
                 } catch (Throwable ignored) {}
                 return true;
             }
@@ -4479,7 +4520,28 @@ public class HomeActivity extends AppCompatActivity {
                                 .setTitle("অনুমতি চাইছে")
                                 .setMessage(origin + "\n\nএই সাইটটি ব্যবহার করতে চায়: " + names)
                                 .setPositiveButton("অনুমতি দিন", (d, w) -> {
-                                    try { request.grant(resources); } catch (Exception ignored) {}
+                                    try {
+                                        // সাইটকে দেওয়ার আগে অ্যাপের নিজের কাছে সেই
+                                        // পারমিশন থাকতে হয় — না থাকলে সাইটের
+                                        // অনুরোধ এখন মঞ্জুর করা যায় না
+                                        ArrayList<String> missing = new ArrayList<>();
+                                        for (String res : resources) {
+                                            if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(res)
+                                                    && checkSelfPermission(android.Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                                                missing.add(android.Manifest.permission.CAMERA);
+                                            } else if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(res)
+                                                    && checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                                                missing.add(android.Manifest.permission.RECORD_AUDIO);
+                                            }
+                                        }
+                                        if (missing.isEmpty()) {
+                                            request.grant(resources);
+                                        } else {
+                                            request.deny();
+                                            launchingInternalActivity = true;
+                                            requestPermissions(missing.toArray(new String[0]), 702);
+                                        }
+                                    } catch (Exception ignored) {}
                                 })
                                 .setNegativeButton("দেবো না", (d, w) -> {
                                     try { request.deny(); } catch (Exception ignored) {}
@@ -4498,7 +4560,21 @@ public class HomeActivity extends AppCompatActivity {
                 new AlertDialog.Builder(HomeActivity.this)
                         .setTitle("লোকেশন চাইছে")
                         .setMessage(origin + "\n\nএই সাইটটি আপনার লোকেশন জানতে চায়।")
-                        .setPositiveButton("অনুমতি দিন", (d, w) -> callback.invoke(origin, true, false))
+                        .setPositiveButton("অনুমতি দিন", (d, w) -> {
+                            boolean hasFine = HomeActivity.this.checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+                            boolean hasCoarse = HomeActivity.this.checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+                            if (hasFine || hasCoarse) {
+                                callback.invoke(origin, true, false);
+                            } else {
+                                // অ্যাপের নিজের লোকেশন অনুমতি না থাকলে সাইটকে
+                                // দেওয়া যায় না — অ্যাপের অনুমতি চাওয়া হচ্ছে
+                                callback.invoke(origin, false, false);
+                                launchingInternalActivity = true;
+                                HomeActivity.this.requestPermissions(new String[]{
+                                        android.Manifest.permission.ACCESS_FINE_LOCATION,
+                                        android.Manifest.permission.ACCESS_COARSE_LOCATION}, 702);
+                            }
+                        })
                         .setNegativeButton("দেবো না", (d, w) -> callback.invoke(origin, false, false))
                         .setOnCancelListener(d -> callback.invoke(origin, false, false))
                         .show();
@@ -4922,16 +4998,34 @@ public class HomeActivity extends AppCompatActivity {
         else rbPin.setChecked(true);
         root.addView(rg);
 
-        // PIN প্লেইনটেক্সটে দেখানো হয় না — বদলাতে চাইলে নতুন PIN লিখতে হবে
-        final EditText inputPin = createStyledEditText("PIN", "", false);
+        // PIN বদলাতে হলে বর্তমান PIN জানতে হবে (আগে থেকে সেট থাকলে);
+        // নতুন PIN-এর কনফার্ম লাগবে — একটা ভুল টাইপে কেউ লকআউট না হয়
+        final boolean hasExistingPin = AppUtil.hasPin(sharedPrefs);
+        final EditText inputCurrentPin;
+        if (hasExistingPin) {
+            inputCurrentPin = createStyledEditText("বর্তমান PIN", "", true);
+            root.addView(inputCurrentPin);
+        } else {
+            inputCurrentPin = null;
+        }
+        final EditText inputPin = createStyledEditText("নতুন PIN", "", true);
         root.addView(inputPin);
+        final EditText inputConfirmPin = createStyledEditText("নতুন PIN আবার লিখুন", "", true);
+        root.addView(inputConfirmPin);
 
         final CheckBox cbBio = new CheckBox(this);
         cbBio.setText("Fingerprint Unlock");
         cbBio.setTextColor(Color.parseColor("#CBD5E1"));
         cbBio.setChecked(useBio);
+        cbBio.setEnabled(lockType != 0);
         cbBio.setPadding(dpToPx(6), dpToPx(6), dpToPx(6), dpToPx(6));
         root.addView(cbBio);
+
+        rg.setOnCheckedChangeListener((group, checkedId) -> {
+            boolean pinOn = rbPin.isChecked();
+            cbBio.setEnabled(pinOn);
+            if (!pinOn) cbBio.setChecked(false);
+        });
 
         builder.setView(root);
         final AlertDialog dialog = builder.create();
@@ -4956,18 +5050,31 @@ public class HomeActivity extends AppCompatActivity {
         attachTouchBounceAnimation(btnSave);
         btnSave.setOnClickListener(v -> {
             SharedPreferences.Editor editor = sharedPrefs.edit();
+            if (hasExistingPin) {
+                String current = inputCurrentPin != null ? inputCurrentPin.getText().toString().trim() : "";
+                if (current.isEmpty() || !AppUtil.verifyPin(sharedPrefs, current)) {
+                    Toast.makeText(HomeActivity.this, "বর্তমান PIN ভুল!", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+            }
             if (rbNone.isChecked()) {
                 editor.putInt("LOCK_TYPE", 0);
+                editor.putBoolean("USE_BIOMETRIC", false);
             } else {
                 String pin = inputPin.getText().toString().trim();
-                if (pin.isEmpty()) {
-                    Toast.makeText(HomeActivity.this, "PIN খালি রাখা যাবে না!", Toast.LENGTH_SHORT).show();
+                if (pin.length() < 4) {
+                    Toast.makeText(HomeActivity.this, "PIN কমপক্ষে ৪ অক্ষরের হতে হবে!", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                String confirm = inputConfirmPin.getText().toString().trim();
+                if (!pin.equals(confirm)) {
+                    Toast.makeText(HomeActivity.this, "দুটো PIN মিলছে না!", Toast.LENGTH_SHORT).show();
                     return;
                 }
                 editor.putInt("LOCK_TYPE", 1);
                 AppUtil.savePin(sharedPrefs, pin);
+                editor.putBoolean("USE_BIOMETRIC", cbBio.isChecked());
             }
-            editor.putBoolean("USE_BIOMETRIC", cbBio.isChecked());
             editor.apply();
             dismissPopupWithAnimation(dialog, root, null);
         });
