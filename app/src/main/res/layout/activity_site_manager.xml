@@ -17,9 +17,9 @@
             android:layout_height="?attr/actionBarSize"
             android:background="#0A0A0A"
             app:navigationIcon="?attr/homeAsUpIndicator"
-            app:navigationIconTint="#0D9488"
+            app:navigationIconTint="#00F5A0"
             app:title="Manage Preloaded Sites"
-            app:titleTextColor="#0D9488" />
+            app:titleTextColor="#00F5A0" />
 
         <ScrollView
             android:layout_width="match_parent"
@@ -43,7 +43,7 @@
         android:layout_gravity="bottom|end"
         android:layout_margin="24dp"
         android:src="@android:drawable/ic_input_add"
-        app:backgroundTint="#0D9488"
+        app:backgroundTint="#00F5A0"
         app:tint="#FFFFFF" />
 
 </FrameLayout>
