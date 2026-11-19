@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Auto Backup থেকে PIN-এর prefs বাদ দেওয়া হয় — নইলে আনইনস্টল করে
+     আবার বসালেও ভুলে যাওয়া PIN ফিরে আসতো (লকআউট থেকে মুক্তির পথ বন্ধ) -->
+<resources>
+    <exclude domain="sharedpref" path="ProStreamLockPrefs.xml"/>
+</resources>

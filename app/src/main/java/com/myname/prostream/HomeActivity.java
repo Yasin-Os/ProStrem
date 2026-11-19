@@ -5267,7 +5267,7 @@ public class HomeActivity extends AppCompatActivity {
 
         // PIN বদলাতে হলে বর্তমান PIN জানতে হবে (আগে থেকে সেট থাকলে);
         // নতুন PIN-এর কনফার্ম লাগবে — একটা ভুল টাইপে কেউ লকআউট না হয়
-        final boolean hasExistingPin = AppUtil.hasPin(sharedPrefs);
+        final boolean hasExistingPin = AppUtil.hasPin(this);
         final EditText inputCurrentPin;
         if (hasExistingPin) {
             inputCurrentPin = createStyledEditText("বর্তমান PIN", "", true);
@@ -5319,7 +5319,7 @@ public class HomeActivity extends AppCompatActivity {
             SharedPreferences.Editor editor = sharedPrefs.edit();
             if (hasExistingPin) {
                 String current = inputCurrentPin != null ? inputCurrentPin.getText().toString().trim() : "";
-                if (current.isEmpty() || !AppUtil.verifyPin(sharedPrefs, current)) {
+                if (current.isEmpty() || !AppUtil.verifyPin(this, current)) {
                     Toast.makeText(HomeActivity.this, "বর্তমান PIN ভুল!", Toast.LENGTH_SHORT).show();
                     return;
                 }
@@ -5339,7 +5339,7 @@ public class HomeActivity extends AppCompatActivity {
                     return;
                 }
                 editor.putInt("LOCK_TYPE", 1);
-                AppUtil.savePin(sharedPrefs, pin);
+                AppUtil.savePin(this, pin);
                 editor.putBoolean("USE_BIOMETRIC", cbBio.isChecked());
             }
             editor.apply();

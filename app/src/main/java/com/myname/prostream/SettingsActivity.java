@@ -297,6 +297,14 @@ public class SettingsActivity extends AppCompatActivity {
             Toast.makeText(this, "ব্যাকআপ করার মতো কোনো সাইট নেই", Toast.LENGTH_SHORT).show();
             return;
         }
+        // নষ্ট JSON যাচাই ছাড়া লিখলে নষ্ট ব্যাকআপ ফাইল তৈরি হতো, যা
+        // রিস্টোরে ফিরিয়ে দেওয়া যেতো না
+        try {
+            new JSONArray(json);
+        } catch (Exception e) {
+            Toast.makeText(this, "সাইটের তালিকা নষ্ট — ব্যাকআপ করা যায়নি", Toast.LENGTH_SHORT).show();
+            return;
+        }
         String fileName = "ProStream-sites-backup.json";
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -330,6 +338,7 @@ public class SettingsActivity extends AppCompatActivity {
     }
 
     private void handleRestoreUri(Uri uri) {
+        JSONArray parsed;
         try (InputStream is = getContentResolver().openInputStream(uri);
              BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
             StringBuilder sb = new StringBuilder();
@@ -338,16 +347,40 @@ public class SettingsActivity extends AppCompatActivity {
             JSONArray arr = new JSONArray(sb.toString());
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject o = arr.getJSONObject(i);
-                if (o.optString("name", "").trim().isEmpty()
-                        || o.optString("url", "").trim().isEmpty()) {
+                String name = o.optString("name", "").trim();
+                String url = o.optString("url", "").trim();
+                if (name.isEmpty() || url.isEmpty() || !isValidSiteUrl(url)) {
                     throw new Exception("Invalid site entry");
                 }
             }
-            prefs.edit().putString("SITES_JSON", arr.toString()).apply();
-            refreshCardStates();
-            Toast.makeText(this, "ব্যাকআপ রিস্টোর হয়েছে (" + arr.length() + "টি সাইট)", Toast.LENGTH_SHORT).show();
+            parsed = arr;
         } catch (Exception e) {
             Toast.makeText(this, "ব্যাকআপ ফাইলটি সঠিক নয়", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        // ভুল ফাইল বাছলেই পুরো তালিকা মুছে যেতো — এখন কনফার্ম চাওয়া হয়
+        new AlertDialog.Builder(this)
+                .setTitle("রিস্টোর করবেন?")
+                .setMessage("এই ফাইলের " + parsed.length() + "টি সাইট দিয়ে বর্তমান তালিকা পুরোপুরি বদলে যাবে। বর্তমান সাইটগুলো মুছে যাবে।")
+                .setPositiveButton("রিস্টোর করুন", (d, w) -> {
+                    prefs.edit().putString("SITES_JSON", parsed.toString()).apply();
+                    refreshCardStates();
+                    Toast.makeText(this, "ব্যাকআপ রিস্টোর হয়েছে (" + parsed.length() + "টি সাইট)", Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("বাতিল", null)
+                .show();
+    }
+
+    // SiteManager-এর SM5 নিয়ম — হোস্টে ডট থাকতে হবে (সঠিক ডোমেইন)
+    private static boolean isValidSiteUrl(String url) {
+        try {
+            String u = url.trim();
+            if (!u.startsWith("http://") && !u.startsWith("https://")) u = "https://" + u;
+            Uri parsed = Uri.parse(u);
+            String host = parsed != null ? parsed.getHost() : null;
+            return host != null && host.contains(".");
+        } catch (Exception ignored) {
+            return false;
         }
     }
 
@@ -358,7 +391,7 @@ public class SettingsActivity extends AppCompatActivity {
         setCardSubtitle(cardInterface, "বর্তমান রং: " + hex.toUpperCase());
         int lockType = prefs.getInt("LOCK_TYPE", 1);
         String lockState = lockType == 0 ? "লক বন্ধ আছে"
-                : (AppUtil.hasPin(prefs) ? "PIN লক চালু আছে" : "লক চালু আছে (PIN সেট হয়নি)");
+                : (AppUtil.hasPin(this) ? "PIN লক চালু আছে" : "লক চালু আছে (PIN সেট হয়নি)");
         setCardSubtitle(cardAppLock, lockState);
         setCardSubtitle(cardSmartDNS, "হোস্ট: p2.freedns.controld.com");
     }

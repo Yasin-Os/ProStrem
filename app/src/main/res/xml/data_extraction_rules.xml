@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12+ (API 31+) এর ব্যাকআপ/ট্রান্সফার নিয়ম — PIN-এর prefs
+     ক্লাউড ব্যাকআপ আর ডিভাইস ট্রান্সফার, দুটো থেকেই বাদ -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="ProStreamLockPrefs.xml"/>
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="ProStreamLockPrefs.xml"/>
+    </device-transfer>
+</data-extraction-rules>
