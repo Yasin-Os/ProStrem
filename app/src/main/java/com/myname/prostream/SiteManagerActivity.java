@@ -75,7 +75,7 @@ public class SiteManagerActivity extends AppCompatActivity {
                 JSONObject site = sitesArray.getJSONObject(i);
                 String name = site.optString("name", "Site");
                 String url = site.optString("url", "");
-                String colorHex = site.optString("color", "#0D9488");
+                String colorHex = site.optString("color", "#00F5A0");
 
                 MaterialCardView card = new MaterialCardView(this);
                 LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
@@ -97,7 +97,7 @@ public class SiteManagerActivity extends AppCompatActivity {
                 iconCard.setLayoutParams(new LinearLayout.LayoutParams(dpToPx(44), dpToPx(44)));
                 iconCard.setRadius(dpToPx(12));
                 iconCard.setCardElevation(0);
-                iconCard.setCardBackgroundColor(AppUtil.parseColorSafe(colorHex, Color.parseColor("#0D9488")));
+                iconCard.setCardBackgroundColor(AppUtil.parseColorSafe(colorHex, Color.parseColor("#00F5A0")));
 
                 TextView tvLetter = new TextView(this);
                 tvLetter.setLayoutParams(new LinearLayout.LayoutParams(
@@ -222,13 +222,13 @@ public class SiteManagerActivity extends AppCompatActivity {
         layout.addView(makeSliderLabel("নীল (B)"));
         layout.addView(seekBlue);
 
-        int initialColor = Color.parseColor("#0D9488");
+        int initialColor = Color.parseColor("#00F5A0");
         if (index != -1) {
             try {
                 JSONObject s = sitesArray.getJSONObject(index);
                 nameInput.setText(s.getString("name"));
                 urlInput.setText(s.getString("url"));
-                initialColor = Color.parseColor(s.optString("color", "#0D9488"));
+                initialColor = Color.parseColor(s.optString("color", "#00F5A0"));
             } catch (Exception ignored) {}
         }
 
@@ -401,8 +401,8 @@ public class SiteManagerActivity extends AppCompatActivity {
     }
 
     private void applyDynamicTheme() {
-        String hex = prefs.getString("APP_COLOR", "#0D9488");
-        int color = AppUtil.parseColorSafe(hex, Color.parseColor("#0D9488"));
+        String hex = prefs.getString("APP_COLOR", "#00F5A0");
+        int color = AppUtil.parseColorSafe(hex, Color.parseColor("#00F5A0"));
 
         getWindow().setStatusBarColor(color);
         toolbarSites.setTitleTextColor(color);

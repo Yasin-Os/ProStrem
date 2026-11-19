@@ -41,6 +41,7 @@ import android.widget.Toast;
 
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.appcompat.app.AppCompatDelegate;
 import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowCompat;
@@ -69,6 +70,9 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        // অ্যাপের বাকি অংশ গাঢ় থিমের — হালকা মোডের ফোনেও ডায়ালগগুলো যেন
+        // হালকা না হয়, নাইট মোড ফোর্স করা হয়
+        AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_YES);
         super.onCreate(savedInstanceState);
 
         try {
@@ -274,7 +278,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void applyDynamicTheme() {
-        int color = parseColorSafe(sharedPrefs.getString("APP_COLOR", "#00A884"));
+        int color = parseColorSafe(sharedPrefs.getString("APP_COLOR", "#00F5A0"));
         Window window = getWindow();
         window.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
         window.setStatusBarColor(Color.parseColor("#06080F"));
@@ -295,7 +299,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void startLiveBackgroundAnimation() {
-        int color = parseColorSafe(sharedPrefs.getString("APP_COLOR", "#00A884"));
+        int color = parseColorSafe(sharedPrefs.getString("APP_COLOR", "#00F5A0"));
 
         GradientDrawable glow1 = new GradientDrawable();
         glow1.setGradientType(GradientDrawable.RADIAL_GRADIENT);
@@ -636,7 +640,7 @@ public class MainActivity extends AppCompatActivity {
         try {
             return Color.parseColor(hex);
         } catch (Exception e) {
-            return Color.parseColor("#00A884");
+            return Color.parseColor("#00F5A0");
         }
     }
 

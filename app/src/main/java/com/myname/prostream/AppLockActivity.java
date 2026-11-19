@@ -254,8 +254,8 @@ public class AppLockActivity extends AppCompatActivity {
     }
 
     private void applyThemeColor() {
-        String hex = prefs.getString("APP_COLOR", "#0D9488");
-        int color = AppUtil.parseColorSafe(hex, Color.parseColor("#0D9488"));
+        String hex = prefs.getString("APP_COLOR", "#00F5A0");
+        int color = AppUtil.parseColorSafe(hex, Color.parseColor("#00F5A0"));
 
         getWindow().setStatusBarColor(color);
         toolbarAppLock.setTitleTextColor(color);

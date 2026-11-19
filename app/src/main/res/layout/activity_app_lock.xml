@@ -13,9 +13,9 @@
         android:layout_height="?attr/actionBarSize"
         android:background="#0A0A0A"
         app:navigationIcon="?attr/homeAsUpIndicator"
-        app:navigationIconTint="#0D9488"
+        app:navigationIconTint="#00F5A0"
         app:title="Security &amp; App Lock"
-        app:titleTextColor="#0D9488" />
+        app:titleTextColor="#00F5A0" />
 
     <ScrollView
         android:layout_width="match_parent"
