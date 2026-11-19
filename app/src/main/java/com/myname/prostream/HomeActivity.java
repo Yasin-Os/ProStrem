@@ -170,6 +170,34 @@ public class HomeActivity extends AppCompatActivity {
     private static final Map<Long, Long> lastBytesMap = new ConcurrentHashMap<>();
     private static final Map<Long, Long> lastTimeMap = new ConcurrentHashMap<>();
     private static final Map<Long, Long> currentSpeedMap = new ConcurrentHashMap<>();
+
+    // ডাউনলোড ম্যানেজারের সারি (শিরোনাম/অবস্থা/সাইজ) — ব্যাকগ্রাউন্ড পোলার
+    // প্রতি সেকেন্ডে ভরে, ডাউনলোড ডায়ালগ UI থ্রেড থেকে আর কোয়েরি করে না
+    private static final class DmRow {
+        final long id;
+        final String title;
+        final int status;
+        final long soFar;
+        final long total;
+        final String localUri;
+        DmRow(long id, String title, int status, long soFar, long total, String localUri) {
+            this.id = id;
+            this.title = title;
+            this.status = status;
+            this.soFar = soFar;
+            this.total = total;
+            this.localUri = localUri;
+        }
+    }
+    private static volatile java.util.List<DmRow> cachedDmRows = new ArrayList<>();
+
+    // নোটিফিকেশন আইডি — ডাউনলোড আইডি থেকে পুরো 32 বিটে ছড়িয়ে দেওয়া হয়।
+    // আগের (id % 100000 + 4000) ফর্মুলায় ঠিক ১০০ সেকেন্ড ব্যবধানে শুরু হওয়া
+    // দুটো ডাউনলোড একই আইডি পেয়ে একে অপরের নোটিফিকেশন মুছে দিতো
+    private static int notificationIdForDownload(long downloadId) {
+        long h = downloadId ^ (downloadId >>> 32);
+        return (int) h;
+    }
     private static final Map<Long, CustomDownloadTask> customTasksMap = new ConcurrentHashMap<>();
     private static final ExecutorService customDlExecutor = Executors.newFixedThreadPool(4);
     private static final ExecutorService parallelChunkPool = Executors.newFixedThreadPool(8);
@@ -307,6 +335,9 @@ public class HomeActivity extends AppCompatActivity {
     private long firstRenderCrashTimeMs = 0;
     private final Set<WebView> clearHistoryOnLoadSet = Collections.synchronizedSet(new HashSet<>());
     private final Set<String> fetchingOgUrls = Collections.synchronizedSet(new HashSet<>());
+    // যে সাইটের OG ছবি একবার আনতে ব্যর্থ হয়েছে, সেটা বারবার চেষ্টা করা হয় না —
+    // নইলে প্রত্যেকবার হাব খুললেই হোমপেজ HTML + ছবি আবার নামানো হতো
+    private final Set<String> ogFailedKeys = Collections.synchronizedSet(new HashSet<>());
 
     private SiteItem currentSite;
     private final int appColor = Color.parseColor("#00F5A0");
@@ -411,7 +442,7 @@ public class HomeActivity extends AppCompatActivity {
 
             NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
             if (nm != null) {
-                nm.cancel((int) (Math.abs(cancelId) % 100000L) + 4000);
+                nm.cancel(notificationIdForDownload(cancelId));
             }
         } catch (Exception ignored) {}
     }
@@ -796,6 +827,21 @@ public class HomeActivity extends AppCompatActivity {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == 701) {
             showFirstRunGuideIfNeeded();
+            // স্থায়ীভাবে বারণ করা অনুমতি থাকলে সিস্টেম আর ডায়ালগ দেখাবে না —
+            // ব্যবহারকারীকে সেটিংসে যাওয়ার পথ জানানো হয়
+            if (permissions != null && grantResults != null) {
+                boolean permanentlyDenied = false;
+                for (int i = 0; i < permissions.length && i < grantResults.length; i++) {
+                    if (grantResults[i] != PackageManager.PERMISSION_GRANTED
+                            && !shouldShowRequestPermissionRationale(permissions[i])) {
+                        permanentlyDenied = true;
+                        break;
+                    }
+                }
+                if (permanentlyDenied) {
+                    Toast.makeText(this, "কিছু অনুমতি স্থায়ীভাবে বন্ধ আছে — Settings → Apps → ProStream → Permissions থেকে চালু করুন।", Toast.LENGTH_LONG).show();
+                }
+            }
         } else if (requestCode == 702) {
             boolean allGranted = grantResults != null && grantResults.length > 0;
             if (grantResults != null) {
@@ -924,14 +970,34 @@ public class HomeActivity extends AppCompatActivity {
                 if (task.cancelled || task.status == DownloadManager.STATUS_FAILED) {
                     // ব্যর্থ ডাউনলোডের আটকে থাকা প্রোগ্রেস নোটিফিকেশন সরানো —
                     // না সরালে মনে হয় ডাউনলোড এখনো চলছে
-                    nm.cancel((int) (Math.abs(task.id) % 100000L) + 4000);
+                    nm.cancel(notificationIdForDownload(task.id));
                     continue;
                 }
                 if (task.status == DownloadManager.STATUS_RUNNING || task.status == DownloadManager.STATUS_PENDING) {
                     anyRunning = true;
                     int pct = task.getPercent();
                     long dl = task.downloadedBytes.get();
-                    String spd = formatSpeedStatic(task.speedBps);
+                    if (task.status == DownloadManager.STATUS_PENDING) {
+                        postMediaStyleNotificationCardStatic(ctx, nm, task.id, task.title,
+                                "লাইনে আছে — একটি ডাউনলোড শেষ হলে শুরু হবে", 0, "", true);
+                        continue;
+                    }
+                    // গতি ডেল্টা থেকে মাপা হয় — ইঞ্জিনের শেষ টিকের মান আটকে
+                    // থাকলে থেমে যাওয়া ডাউনলোডও "চলছে" দেখাতো; না বাড়লে
+                    // গতি অর্ধেক হয়ে 0-তে নেমে আসে
+                    long nowMs2 = System.currentTimeMillis();
+                    long prevBytes = lastBytesMap.containsKey(task.id) ? lastBytesMap.get(task.id) : dl;
+                    long prevTime = lastTimeMap.containsKey(task.id) ? lastTimeMap.get(task.id) : (nowMs2 - 1000L);
+                    long dt = Math.max(250L, nowMs2 - prevTime);
+                    long bytesPerSec = (Math.max(0L, dl - prevBytes) * 1000L) / dt;
+                    if (lastBytesMap.containsKey(task.id)) {
+                        long oldSpeed = currentSpeedMap.containsKey(task.id) ? currentSpeedMap.get(task.id) : bytesPerSec;
+                        bytesPerSec = (oldSpeed + bytesPerSec) / 2L;
+                    }
+                    lastBytesMap.put(task.id, dl);
+                    lastTimeMap.put(task.id, nowMs2);
+                    currentSpeedMap.put(task.id, bytesPerSec);
+                    String spd = formatSpeedStatic(bytesPerSec);
                     String sizeStr = task.totalBytes > 0
                             ? (formatBytesStatic(dl) + " / " + formatBytesStatic(task.totalBytes))
                             : formatBytesStatic(dl);
@@ -946,7 +1012,8 @@ public class HomeActivity extends AppCompatActivity {
                 query.setFilterByStatus(
                         DownloadManager.STATUS_RUNNING
                                 | DownloadManager.STATUS_PENDING
-                                | DownloadManager.STATUS_PAUSED);
+                                | DownloadManager.STATUS_PAUSED
+                                | DownloadManager.STATUS_SUCCESSFUL);
 
                 Cursor c = dm.query(query);
                 if (c != null) {
@@ -955,6 +1022,8 @@ public class HomeActivity extends AppCompatActivity {
                     int statusIdx = c.getColumnIndex(DownloadManager.COLUMN_STATUS);
                     int soFarIdx = c.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR);
                     int totalIdx = c.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES);
+                    int uriIdx = c.getColumnIndex(DownloadManager.COLUMN_LOCAL_URI);
+                    List<DmRow> rows = new ArrayList<>();
 
                     long nowMs = System.currentTimeMillis();
 
@@ -971,6 +1040,14 @@ public class HomeActivity extends AppCompatActivity {
                         long total = totalIdx >= 0 ? c.getLong(totalIdx) : -1L;
 
                         if (status == DownloadManager.STATUS_FAILED) {
+                            continue;
+                        }
+
+                        // ডায়ালগের সারি এই ক্যাশ থেকে নেওয়া হয় — UI থ্রেডে
+                        // আর কোয়েরি করা হয় না
+                        String localUri = (uriIdx >= 0 && c.getString(uriIdx) != null) ? c.getString(uriIdx) : "";
+                        rows.add(new DmRow(id, fileTitle, status, soFar, total, localUri));
+                        if (status == DownloadManager.STATUS_SUCCESSFUL) {
                             continue;
                         }
 
@@ -1000,6 +1077,7 @@ public class HomeActivity extends AppCompatActivity {
                         postMediaStyleNotificationCardStatic(ctx, nm, id, fileTitle, statusLine, percent, speedStr, true);
                     }
                     c.close();
+                    cachedDmRows = rows;
                 }
             }
         } catch (Exception ignored) {}
@@ -1050,7 +1128,7 @@ public class HomeActivity extends AppCompatActivity {
     private static void postMediaStyleNotificationCardStatic(Context ctx, NotificationManager nm, long downloadId, String fileTitle, String contentText, int percent, String subPillText, boolean isOngoing) {
         if (ctx == null || nm == null) return;
         try {
-            int notifId = (int) (Math.abs(downloadId) % 100000L) + 4000;
+            int notifId = notificationIdForDownload(downloadId);
 
             Intent openMediaIntent = new Intent(ctx, HomeActivity.class);
             openMediaIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
@@ -1140,7 +1218,7 @@ public class HomeActivity extends AppCompatActivity {
     }
 
     private static String formatSpeedStatic(long bytesPerSec) {
-        if (bytesPerSec <= 0) return "Turbo...";
+        if (bytesPerSec <= 0) return "0 KB/s";
         double mbps = bytesPerSec / (1024.0 * 1024.0);
         if (mbps >= 1.0) {
             return String.format(Locale.US, "%.2f MB/s", mbps);
@@ -2943,6 +3021,18 @@ public class HomeActivity extends AppCompatActivity {
         } catch (Exception ignored) {}
     }
 
+    // একসঙ্গে কতগুলো কাস্টম ডাউনলোড চলছে/লাইনে আছে (এক্সিকিউটর পুল ৪টি)
+    private static int countActiveCustomDownloads() {
+        int n = 0;
+        for (CustomDownloadTask t : customTasksMap.values()) {
+            if (!t.cancelled && (t.status == DownloadManager.STATUS_RUNNING
+                    || t.status == DownloadManager.STATUS_PENDING)) {
+                n++;
+            }
+        }
+        return n;
+    }
+
     private void startCustomStreamOrDirectDownload(final String mediaUrl, final String refererUrl, final String fileName, final boolean isHls) {
         // একই ভিডিওর ডাউনলোড ইতিমধ্যে চললে/থেমে থাকলে নতুন টাস্ক নয় —
         // ডাবল-ট্যাপে দুটো টাস্ক একই ফাইলে লিখে দুটোই নষ্ট করতো
@@ -2962,6 +3052,11 @@ public class HomeActivity extends AppCompatActivity {
 
         final CustomDownloadTask task = new CustomDownloadTask(taskId, fileName, mediaUrl, outFile, isHls);
         task.refererUrl = refererUrl;
+        // একসঙ্গে ৪টির বেশি চললে নতুনটি লাইনে থাকে — নইলে ৫মটি নীরবে
+        // এক্সিকিউটর কিউয়ে আটকে "চলছে" দেখাতো
+        if (countActiveCustomDownloads() >= 4) {
+            task.status = DownloadManager.STATUS_PENDING;
+        }
         customTasksMap.put(taskId, task);
         trackedDownloadIds.add(String.valueOf(taskId));
         sharedPrefs.edit().putStringSet(PREF_DL_IDS_KEY, new HashSet<>(trackedDownloadIds)).apply();
@@ -2971,7 +3066,11 @@ public class HomeActivity extends AppCompatActivity {
         acquireTurboDownloadBoosterStatic(appContextRef);
         startNotificationProgressTrackerStatic(appContextRef);
 
-        Toast.makeText(this, "Downloading: " + fileName, Toast.LENGTH_SHORT).show();
+        if (task.status == DownloadManager.STATUS_PENDING) {
+            Toast.makeText(this, "৪টি ডাউনলোড চলছে — এটি লাইনে আছে", Toast.LENGTH_SHORT).show();
+        } else {
+            Toast.makeText(this, "Downloading: " + fileName, Toast.LENGTH_SHORT).show();
+        }
 
         customDlExecutor.execute(() -> {
             if (isHls) {
@@ -2994,7 +3093,8 @@ public class HomeActivity extends AppCompatActivity {
         task.paused = false;
         task.cancelled = false;
         task.errorMessage = "";
-        task.status = DownloadManager.STATUS_RUNNING;
+        task.status = countActiveCustomDownloads() >= 4
+                ? DownloadManager.STATUS_PENDING : DownloadManager.STATUS_RUNNING;
         startBackgroundDownloadKeeperService(appContextRef);
         acquireTurboDownloadBoosterStatic(appContextRef);
         startNotificationProgressTrackerStatic(appContextRef);
@@ -3020,6 +3120,11 @@ public class HomeActivity extends AppCompatActivity {
     private void executeDirectHttpTurboDownload(final CustomDownloadTask task, final String refererUrl) {
         HttpURLConnection conn = null;
         try {
+            // এক্সিকিউটর আসলে শুরু করলেই RUNNING — লাইনে থাকা টাস্ক
+            // আগেই RUNNING দেখাতো
+            if (!task.paused && !task.cancelled) {
+                task.status = DownloadManager.STATUS_RUNNING;
+            }
             conn = openBrowserLikeConnectionWithRedirects(task.url, refererUrl, "bytes=0-");
             int respCode = conn.getResponseCode();
             String cType = conn.getContentType() != null ? conn.getContentType().toLowerCase(Locale.ROOT) : "";
@@ -3297,13 +3402,24 @@ public class HomeActivity extends AppCompatActivity {
     private void executeHlsM3u8Download(final CustomDownloadTask task, final String refererUrl) {
         FileOutputStream fos = null;
         try {
+            // এক্সিকিউটর আসলে শুরু করলেই RUNNING — লাইনে থাকা টাস্ক
+            // আগেই RUNNING দেখাতো
+            if (!task.paused && !task.cancelled) {
+                task.status = DownloadManager.STATUS_RUNNING;
+            }
             String[] playlistResult = fetchTextAndFinalUrlWithCookies(task.url, refererUrl);
             String playlistText = playlistResult[0];
             String activePlaylistUrl = playlistResult[1];
 
             if (playlistText.contains("#EXT-X-STREAM-INF")) {
+                // সবচেয়ে ভারী ভ্যারিয়েন্ট নয় — হালকা নেটে সেটা আটকে যেতো।
+                // 3 Mbps পর্যন্ত সর্বোচ্চটা নেওয়া হয়; সবগুলো তার বেশি হলে
+                // সবচেয়ে হালকাটা
                 String bestSubUrl = null;
                 long bestBw = -1;
+                String lowestSubUrl = null;
+                long lowestBw = Long.MAX_VALUE;
+                final long MAX_VARIANT_BW = 3000000L;
                 String[] lines = playlistText.split("\n");
                 for (int i = 0; i < lines.length; i++) {
                     String line = lines[i].trim();
@@ -3317,14 +3433,22 @@ public class HomeActivity extends AppCompatActivity {
                             String next = lines[k].trim();
                             if (next.isEmpty()) continue;
                             if (!next.startsWith("#")) {
-                                if (bw >= bestBw) {
+                                String subUrl = resolveRelativeUrl(activePlaylistUrl, next);
+                                if (bw < lowestBw) {
+                                    lowestBw = bw;
+                                    lowestSubUrl = subUrl;
+                                }
+                                if (bw <= MAX_VARIANT_BW && bw >= bestBw) {
                                     bestBw = bw;
-                                    bestSubUrl = resolveRelativeUrl(activePlaylistUrl, next);
+                                    bestSubUrl = subUrl;
                                 }
                                 break;
                             }
                         }
                     }
+                }
+                if (bestSubUrl == null) {
+                    bestSubUrl = lowestSubUrl;
                 }
                 if (bestSubUrl != null) {
                     String[] subRes = fetchTextAndFinalUrlWithCookies(bestSubUrl, refererUrl);
@@ -3411,8 +3535,22 @@ public class HomeActivity extends AppCompatActivity {
             final List<byte[]> finalSegIvs = segIvs;
             final int finalSeqBase = mediaSequenceBase;
 
+            int persistedSegTotal = task.totalSegments;
             task.totalSegments = segmentUrls.size();
             boolean resumeHls = task.completedSegments > 0 && task.outputFile.exists() && task.downloadedBytes.get() > 0;
+            if (resumeHls) {
+                // ইনডেক্স ধরে রিজিউম শুধু সম্পূর্ণ (ENDLIST) প্লেলিস্টেই নিরাপদ —
+                // লাইভ/বদলে যাওয়া প্লেলিস্টে একই ইনডেক্সে অন্য সেগমেন্ট থাকে,
+                // জোড়া লাগলে ভিডিও নষ্ট হতো অথচ "সফল" দেখাতো; তখন শুরু থেকে
+                boolean playlistComplete = playlistText.contains("#EXT-X-ENDLIST");
+                if (!playlistComplete || (persistedSegTotal > 0 && segmentUrls.size() != persistedSegTotal)) {
+                    resumeHls = false;
+                    task.completedSegments = 0;
+                    task.downloadedBytes.set(0);
+                    task.totalBytes = -1;
+                    persistCustomDownloadTasksStatic(appContextRef);
+                }
+            }
             fos = new FileOutputStream(task.outputFile, resumeHls);
             long lastTick = System.currentTimeMillis();
             long bytesAtLastTick = 0;
@@ -3745,23 +3883,30 @@ public class HomeActivity extends AppCompatActivity {
             itemCount++;
             int pct = task.getPercent();
             long dl = task.downloadedBytes.get();
-            String speedStr = task.speedBps > 0 ? ("  •  " + formatSpeedStatic(task.speedBps)) : "";
+            // গতি পোলারের মসৃণ মান থেকে — থেমে গেলে সেটা 0-তে নামে,
+            // ইঞ্জিনের শেষ টিকের মান আটকে থাকতো
+            long dialogSpeedBps = currentSpeedMap.containsKey(task.id) ? currentSpeedMap.get(task.id) : task.speedBps;
+            String speedStr = dialogSpeedBps > 0 ? ("  •  " + formatSpeedStatic(dialogSpeedBps)) : "";
             String statusText;
             String badgeColor;
             String actionLabel = null;
             View.OnClickListener actionListener = null;
-            boolean isRunning = (task.status == DownloadManager.STATUS_RUNNING || task.status == DownloadManager.STATUS_PAUSED);
+            boolean isRunning = (task.status == DownloadManager.STATUS_RUNNING || task.status == DownloadManager.STATUS_PAUSED
+                    || task.status == DownloadManager.STATUS_PENDING);
 
             if (task.exporting) {
                 statusText = "Saving to Downloads…";
                 badgeColor = "#38BDF8";
+            } else if (task.status == DownloadManager.STATUS_PENDING) {
+                statusText = "লাইনে আছে — একটি ডাউনলোড শেষ হলে শুরু হবে";
+                badgeColor = "#00E5FF";
             } else if (task.status == DownloadManager.STATUS_RUNNING) {
                 String sz = task.totalBytes > 0
                         ? (formatBytesStatic(dl) + " / " + formatBytesStatic(task.totalBytes))
                         : formatBytesStatic(dl);
                 statusText = pct + "%  •  " + sz + speedStr;
-                if (task.speedBps > 0 && task.totalBytes > 0 && dl < task.totalBytes) {
-                    long remainingSec = (task.totalBytes - dl) / Math.max(1L, task.speedBps);
+                if (dialogSpeedBps > 0 && task.totalBytes > 0 && dl < task.totalBytes) {
+                    long remainingSec = (task.totalBytes - dl) / Math.max(1L, dialogSpeedBps);
                     statusText += "  •  " + formatEtaStatic(remainingSec);
                 }
                 badgeColor = "#00E5FF";
@@ -3831,72 +3976,52 @@ public class HomeActivity extends AppCompatActivity {
             }
         } catch (Exception ignored) {}
 
-        try {
-            DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
-            if (dm != null && !trackedDownloadIds.isEmpty()) {
-                DownloadManager.Query query = new DownloadManager.Query();
-                query.setFilterByStatus(
-                        DownloadManager.STATUS_RUNNING
-                                | DownloadManager.STATUS_PENDING
-                                | DownloadManager.STATUS_PAUSED
-                                | DownloadManager.STATUS_SUCCESSFUL);
-
-                Cursor c = dm.query(query);
-                if (c != null) {
-                    int idIdx = c.getColumnIndex(DownloadManager.COLUMN_ID);
-                    int titleIdx = c.getColumnIndex(DownloadManager.COLUMN_TITLE);
-                    int statusIdx = c.getColumnIndex(DownloadManager.COLUMN_STATUS);
-                    int soFarIdx = c.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR);
-                    int totalIdx = c.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES);
-                    int uriIdx = c.getColumnIndex(DownloadManager.COLUMN_LOCAL_URI);
-
-                    while (c.moveToNext() && itemCount < 20) {
-                        final long id = idIdx >= 0 ? c.getLong(idIdx) : -1L;
-                        if (!trackedDownloadIds.contains(String.valueOf(id)) || renderedIds.contains(id)) {
-                            continue;
-                        }
-
-                        final String fileTitle = (titleIdx >= 0 && c.getString(titleIdx) != null)
-                                ? c.getString(titleIdx) : "Video.mp4";
-                        final int status = statusIdx >= 0 ? c.getInt(statusIdx) : 0;
-                        long soFar = soFarIdx >= 0 ? c.getLong(soFarIdx) : 0L;
-                        long total = totalIdx >= 0 ? c.getLong(totalIdx) : -1L;
-                        final String localUri = uriIdx >= 0 ? c.getString(uriIdx) : "";
-
-                        renderedIds.add(id);
-                        itemCount++;
-                        int percent = (total > 0) ? (int) ((soFar * 100L) / total) : 0;
-                        long speedBps = currentSpeedMap.containsKey(id) ? currentSpeedMap.get(id) : 0L;
-                        String speedLabel = speedBps > 0 ? ("  •  " + formatSpeedStatic(speedBps)) : "";
-                        boolean isRunning = (status == DownloadManager.STATUS_RUNNING || status == DownloadManager.STATUS_PENDING);
-
-                        String statusText;
-                        String badgeColor;
-                        if (isRunning) {
-                            statusText = (total > 0)
-                                    ? (percent + "%  •  " + formatBytesStatic(soFar) + " / " + formatBytesStatic(total) + speedLabel)
-                                    : (formatBytesStatic(soFar) + speedLabel);
-                            badgeColor = "#00E5FF";
-                        } else {
-                            percent = 100;
-                            statusText = formatBytesStatic(total > 0 ? total : soFar) + "  •  Completed";
-                            badgeColor = "#00F5A0";
-                        }
-
-                        addMediaDownloadCardRow(container, id, fileTitle, statusText, badgeColor, percent, isRunning, v -> {
-                            if (!isRunning) {
-                                parentDialog.dismiss();
-                                openDownloadedVideoItem(localUri, "");
-                            }
-                        }, v -> {
-                            cancelOrRemoveDownloadStatic(appContextRef, id);
-                            populateLiveDownloadsList(container, parentDialog);
-                        }, null, null);
-                    }
-                    c.close();
-                }
+        // DownloadManager-এর সারি ব্যাকগ্রাউন্ড পোলারের ক্যাশ থেকে নেওয়া হয় —
+        // এই ডায়ালগ প্রতি সেকেন্ডে রিফ্রেশ হয়, UI থ্রেডে কোয়েরি করলে ল্যাগ হতো
+        List<DmRow> dmRows = new ArrayList<>(cachedDmRows);
+        for (DmRow row : dmRows) {
+            if (itemCount >= 20) break;
+            final long id = row.id;
+            if (!trackedDownloadIds.contains(String.valueOf(id)) || renderedIds.contains(id)) {
+                continue;
             }
-        } catch (Exception ignored) {}
+
+            final String fileTitle = row.title;
+            final int status = row.status;
+            long soFar = row.soFar;
+            long total = row.total;
+            final String localUri = row.localUri;
+
+            renderedIds.add(id);
+            itemCount++;
+            int percent = (total > 0) ? (int) ((soFar * 100L) / total) : 0;
+            long speedBps = currentSpeedMap.containsKey(id) ? currentSpeedMap.get(id) : 0L;
+            String speedLabel = speedBps > 0 ? ("  •  " + formatSpeedStatic(speedBps)) : "";
+            boolean isRunning = (status == DownloadManager.STATUS_RUNNING || status == DownloadManager.STATUS_PENDING);
+
+            String statusText;
+            String badgeColor;
+            if (isRunning) {
+                statusText = (total > 0)
+                        ? (percent + "%  •  " + formatBytesStatic(soFar) + " / " + formatBytesStatic(total) + speedLabel)
+                        : (formatBytesStatic(soFar) + speedLabel);
+                badgeColor = "#00E5FF";
+            } else {
+                percent = 100;
+                statusText = formatBytesStatic(total > 0 ? total : soFar) + "  •  Completed";
+                badgeColor = "#00F5A0";
+            }
+
+            addMediaDownloadCardRow(container, id, fileTitle, statusText, badgeColor, percent, isRunning, v -> {
+                if (!isRunning) {
+                    parentDialog.dismiss();
+                    openDownloadedVideoItem(localUri, "");
+                }
+            }, v -> {
+                cancelOrRemoveDownloadStatic(appContextRef, id);
+                populateLiveDownloadsList(container, parentDialog);
+            }, null, null);
+        }
 
         if (itemCount == 0) {
             TextView emptyTv = new TextView(this);
@@ -4294,6 +4419,22 @@ public class HomeActivity extends AppCompatActivity {
         showAnimatedDialog(dialog, root);
     }
 
+    // স্কিম/www/শেষের স্ল্যাশ উপেক্ষা করে দুটো সাইট-URL এক কি না
+    private static boolean sameSiteUrl(String a, String b) {
+        if (a == null || b == null) return false;
+        String x = a.trim().toLowerCase(Locale.ROOT);
+        String y = b.trim().toLowerCase(Locale.ROOT);
+        if (x.startsWith("http://")) x = x.substring(7);
+        else if (x.startsWith("https://")) x = x.substring(8);
+        if (y.startsWith("http://")) y = y.substring(7);
+        else if (y.startsWith("https://")) y = y.substring(8);
+        if (x.startsWith("www.")) x = x.substring(4);
+        if (y.startsWith("www.")) y = y.substring(4);
+        while (x.endsWith("/")) x = x.substring(0, x.length() - 1);
+        while (y.endsWith("/")) y = y.substring(0, y.length() - 1);
+        return x.equals(y);
+    }
+
     private void showAddOrEditSiteDialog(final int editIndex) {
         final boolean isNew = (editIndex < 0 || editIndex >= siteList.size());
         final SiteItem existing = isNew ? new SiteItem("", "", "#00F5A0", "") : siteList.get(editIndex);
@@ -4368,13 +4509,23 @@ public class HomeActivity extends AppCompatActivity {
             String n = inputName.getText().toString().trim();
             String u = inputUrl.getText().toString().trim();
             if (n.isEmpty() || u.isEmpty()) {
+                Toast.makeText(this, "নাম আর URL দুটোই লিখুন", Toast.LENGTH_SHORT).show();
                 return;
             }
             if (!u.startsWith("http://") && !u.startsWith("https://")) {
                 u = "https://" + u;
             }
+            // ডুপ্লিকেট URL — এডিটের সময় নিজের এন্ট্রি বাদে
+            for (int i = 0; i < siteList.size(); i++) {
+                if (!isNew && i == editIndex) continue;
+                if (sameSiteUrl(siteList.get(i).url, u)) {
+                    Toast.makeText(this, "এই URL already আছে!", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+            }
             String ogToKeep = (!isNew && existing.url.equalsIgnoreCase(u)) ? existing.ogImage : "";
-            final SiteItem updated = new SiteItem(n, u, "#00F5A0", ogToKeep);
+            // এডিটে আগের রংটাই থাকে — নতুন সাইটে ডিফল্ট রং
+            final SiteItem updated = new SiteItem(n, u, isNew ? "#00F5A0" : existing.color, ogToKeep);
             if (isNew) {
                 siteList.add(updated);
             } else {
@@ -4507,8 +4658,12 @@ public class HomeActivity extends AppCompatActivity {
                 if (request == null || request.getUrl() == null) return false;
                 String url = request.getUrl().toString();
 
-                if (isImageOrFaviconUrl(url) || isBlockedAdUrl(url)) {
+                if (isBlockedAdUrl(url)) {
                     return true;
+                }
+
+                if (isImageOrFaviconUrl(url)) {
+                    return false;
                 }
 
                 if (url.startsWith("blob:")) {
@@ -4538,6 +4693,14 @@ public class HomeActivity extends AppCompatActivity {
                     return true;
                 }
 
+                // tel:/mailto:/market:/sms: ইত্যাদি — WebView খুলতে পারে না,
+                // বাইরের অ্যাপে পাঠানো হয়; খোলার মতো অ্যাপ না থাকলে চুপচাপ বাদ
+                try {
+                    Intent ext = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+                    if (ext.resolveActivity(getPackageManager()) != null) {
+                        startActivity(ext);
+                    }
+                } catch (Exception ignored) {}
                 return true;
             }
 
@@ -4606,7 +4769,7 @@ public class HomeActivity extends AppCompatActivity {
                 if (request == null || !request.isForMainFrame() || view != webView) return;
                 if (errorResponse == null) return;
                 int code = errorResponse.getStatusCode();
-                if (code != 404 && code != 500 && code != 502 && code != 503 && code != 504) return;
+                if (code != 401 && code != 403 && code != 404 && code != 429 && code != 500 && code != 502 && code != 503 && code != 504) return;
                 if (isCloudflareChallengePage(view)) return;
                 String failingUrl = request.getUrl() != null ? request.getUrl().toString() : "";
                 view.stopLoading();
@@ -4646,9 +4809,26 @@ public class HomeActivity extends AppCompatActivity {
                 // নইলে এক পেজেই অনেক টোস্ট জমে অ্যাপ ছাড়ার পরও দেখাতে থাকে।
                 if (view != webView) return;
                 String failingUrl = error != null && error.getUrl() != null ? error.getUrl() : "";
-                boolean isMainFrame = !failingUrl.isEmpty()
-                        && (failingUrl.equals(lastMainFrameNavUrl)
-                        || (currentSite != null && failingUrl.startsWith(currentSite.getEffectiveUrl())));
+                // মূল পেজের URL-র সঙ্গে হোস্ট+পাথ মেলাতে হবে — শুধু সাইটের
+                // URL দিয়ে startsWith করলে একই হোস্টের সাব-রিসোর্সের (ভিডিও
+                // সেগমেন্ট, ছবি) SSL এররকেও মূল পেজের এরর ধরা হতো
+                boolean isMainFrame = false;
+                if (!failingUrl.isEmpty() && lastMainFrameNavUrl != null && !lastMainFrameNavUrl.isEmpty()) {
+                    if (failingUrl.equals(lastMainFrameNavUrl)) {
+                        isMainFrame = true;
+                    } else {
+                        try {
+                            Uri failUri = Uri.parse(failingUrl);
+                            Uri mainUri = Uri.parse(lastMainFrameNavUrl);
+                            String failHost = failUri.getHost();
+                            String mainHost = mainUri.getHost();
+                            String failPath = failUri.getPath() != null ? failUri.getPath() : "";
+                            String mainPath = mainUri.getPath() != null ? mainUri.getPath() : "";
+                            isMainFrame = failHost != null && failHost.equalsIgnoreCase(mainHost)
+                                    && failPath.equals(mainPath);
+                        } catch (Exception ignored) {}
+                    }
+                }
                 if (!isMainFrame) return;
                 lastMainFrameFailedSsl = true;
                 if (failingUrl.startsWith("http")) {
@@ -4728,8 +4908,7 @@ public class HomeActivity extends AppCompatActivity {
                     return;
                 }
 
-                CookieManager.getInstance().flush();
-
+                // কুকি ফ্লাশ প্রত্যেক পেজ শেষে নয় — onPause/onStop/Exit-এ হয়
                 String pageTitleLower = view.getTitle() != null ? view.getTitle().toLowerCase(Locale.ROOT) : "";
                 String urlLower = url.toLowerCase(Locale.ROOT);
                 if (pageTitleLower.contains("just a moment")
@@ -4905,7 +5084,8 @@ public class HomeActivity extends AppCompatActivity {
                 } else {
                     if (progressBar != null) progressBar.setVisibility(View.GONE);
                     if (swipeRefresh != null) swipeRefresh.setRefreshing(false);
-                    CookieManager.getInstance().flush();
+                    // কুকি ফ্লাশ প্রত্যেক পেজ শেষে নয় — onPause/onStop/Exit-এ
+                    // হয়; এখানে করলে প্রত্যেক পেজে ডিস্ক I/O হতো
                 }
             }
 
@@ -4984,9 +5164,25 @@ public class HomeActivity extends AppCompatActivity {
             if (filePathCallback != null) {
                 Uri[] results = null;
                 if (resultCode == RESULT_OK && data != null) {
-                    String dataString = data.getDataString();
-                    if (dataString != null) {
-                        results = new Uri[]{Uri.parse(dataString)};
+                    // মাল্টি-সিলেক্ট: ClipData-তে একাধিক ফাইল আসে — শুধু
+                    // getDataString() পড়লে প্রথমটি ছাড়া বাকিগুলো হারাতো
+                    ClipData clipData = data.getClipData();
+                    if (clipData != null && clipData.getItemCount() > 0) {
+                        ArrayList<Uri> picked = new ArrayList<>();
+                        for (int i = 0; i < clipData.getItemCount(); i++) {
+                            ClipData.Item item = clipData.getItemAt(i);
+                            if (item != null && item.getUri() != null) {
+                                picked.add(item.getUri());
+                            }
+                        }
+                        if (!picked.isEmpty()) {
+                            results = picked.toArray(new Uri[0]);
+                        }
+                    } else {
+                        String dataString = data.getDataString();
+                        if (dataString != null) {
+                            results = new Uri[]{Uri.parse(dataString)};
+                        }
                     }
                 }
                 filePathCallback.onReceiveValue(results);
@@ -5080,6 +5276,11 @@ public class HomeActivity extends AppCompatActivity {
 
         targetView.setImageBitmap(createRoundedLetterBitmap(site.name, fallbackColor));
 
+        // আগে ব্যর্থ হয়ে থাকলে আবার হোমপেজ টানাটানি নয়
+        if (ogFailedKeys.contains(cacheKey)) {
+            return;
+        }
+
         if (fetchingOgUrls.contains(cacheKey)) {
             return;
         }
@@ -5125,7 +5326,13 @@ public class HomeActivity extends AppCompatActivity {
                                 targetView.setImageBitmap(rounded);
                             }
                         });
+                    } else {
+                        // ছবি নামেনি — পরেরবার আবার চেষ্টা না করে ব্যর্থ ধরা হয়
+                        ogFailedKeys.add(cacheKey);
                     }
+                } else {
+                    // এই সাইটে OG ছবি নেই — হোমপেজ বারবার টানা হবে না
+                    ogFailedKeys.add(cacheKey);
                 }
             } catch (Exception ignored) {
             } finally {
@@ -6441,6 +6648,13 @@ public class HomeActivity extends AppCompatActivity {
         hostBox.setLayoutParams(boxParams);
         root.addView(hostBox);
 
+        TextView directions = new TextView(this);
+        directions.setText("Settings → Network & internet → Private DNS → \"Private DNS provider hostname\" সিলেক্ট করে উপরের হোস্টটি বসান।");
+        directions.setTextColor(Color.parseColor("#94A3B8"));
+        directions.setTextSize(13f);
+        directions.setPadding(0, 0, 0, dpToPx(14));
+        root.addView(directions);
+
         builder.setView(root);
         final AlertDialog dialog = builder.create();
         if (dialog.getWindow() != null) {
@@ -6455,7 +6669,7 @@ public class HomeActivity extends AppCompatActivity {
         attachTouchBounceAnimation(btnClose);
         btnClose.setOnClickListener(v -> dismissPopupWithAnimation(dialog, root, null));
 
-        TextView btnCopyDns = createDialogButton("Copy & Open Settings", "#06101E", "#00F5A0");
+        TextView btnCopyDns = createDialogButton("Copy & Open Private DNS", "#06101E", "#00F5A0");
         LinearLayout.LayoutParams copyParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         copyParams.setMargins(dpToPx(8), 0, 0, 0);
@@ -6469,7 +6683,18 @@ public class HomeActivity extends AppCompatActivity {
                     if (clipboard != null) clipboard.setPrimaryClip(clip);
                     Toast.makeText(this, "Copied: " + dnsHost, Toast.LENGTH_SHORT).show();
                     launchingInternalActivity = true;
-                    startActivity(new Intent(Settings.ACTION_SETTINGS));
+                    // Private DNS সেটিংস সরাসরি খোলা হয় (API 29+) — না
+                    // থাকলে সাধারণ Settings খোলে
+                    Intent dnsIntent = new Intent("android.settings.PRIVATE_DNS_SETTINGS");
+                    try {
+                        if (dnsIntent.resolveActivity(getPackageManager()) != null) {
+                            startActivity(dnsIntent);
+                        } else {
+                            startActivity(new Intent(Settings.ACTION_SETTINGS));
+                        }
+                    } catch (Exception e) {
+                        startActivity(new Intent(Settings.ACTION_SETTINGS));
+                    }
                 } catch (Exception ignored) {}
             });
         });
@@ -6648,26 +6873,6 @@ public class HomeActivity extends AppCompatActivity {
         }
     }
 
-    private void resetAllWebViewsToSiteHome() {
-        liveDetectedStreamsMap.clear();
-        for (SiteItem s : siteList) {
-            WebView wv = webViewPool.get(s.url);
-            if (wv != null) {
-                try {
-                    // যাচাই চলমান পেজে হাত দেওয়া যাবে না — রিসেট করলে Cloudflare আবার শুরু করে
-                    if (isCloudflareChallengePage(wv)) continue;
-                    wv.stopLoading();
-                    wv.evaluateJavascript("(function(){var m=document.querySelectorAll('video,audio');for(var i=0;i<m.length;i++){try{m[i].pause();m[i].src='';}catch(e){}}})();", null);
-                    String currentUrl = wv.getUrl();
-                    if (currentUrl != null && !isRootHomepageUrl(currentUrl, s.url)) {
-                        clearHistoryOnLoadSet.add(wv);
-                        wv.loadUrl(s.url);
-                    }
-                } catch (Exception ignored) {}
-            }
-        }
-    }
-
     @Override
     protected void onResume() {
         super.onResume();
@@ -6825,10 +7030,15 @@ public class HomeActivity extends AppCompatActivity {
             try {
                 JSONArray array = new JSONArray(json);
                 for (int i = 0; i < array.length(); i++) {
-                    JSONObject obj = array.getJSONObject(i);
+                    JSONObject obj = array.optJSONObject(i);
+                    if (obj == null) continue;
+                    // একটা এন্ট্রিতে name/url না থাকলে পুরো তালিকা উড়ে যেতো —
+                    // এখন শুধু সেই এন্ট্রিটাই বাদ যায়
+                    String siteUrl = obj.optString("url", "");
+                    if (siteUrl.isEmpty()) continue;
                     String siteColor = obj.optString("color", "#00F5A0");
                     String ogImg = cleanedSubpageOg ? obj.optString("ogImage", "") : "";
-                    SiteItem item = new SiteItem(obj.getString("name"), obj.getString("url"), siteColor, ogImg);
+                    SiteItem item = new SiteItem(obj.optString("name", "Site"), siteUrl, siteColor, ogImg);
                     siteList.add(item);
                 }
                 if (!cleanedSubpageOg) {
@@ -6942,11 +7152,13 @@ public class HomeActivity extends AppCompatActivity {
     public void onBackPressed() {
         if (mCustomView != null) {
             exitCustomFullscreen();
-        } else if (modernOfflineOverlay != null && modernOfflineOverlay.getVisibility() == View.VISIBLE) {
+        } else if (modernOfflineOverlay != null && modernOfflineOverlay.getVisibility() == View.VISIBLE
+                && webView != null && webView.canGoBack()) {
+            // অফলাইন স্ক্রিন থেকে ব্যাক = আগের পেজে ফেরা। ইতিহাস না থাকলে
+            // অফলাইন স্ক্রিন লুকালে ফাঁকা পেজ দেখাতো — তাই সেক্ষেত্রে নিচের
+            // Exit ডায়ালগেই যাওয়া হয় (Retry বোতামও খোলা থাকে)
             hideModernOfflineScreen();
-            if (webView != null && webView.canGoBack()) {
-                goBackWithSmoothAnimation();
-            }
+            goBackWithSmoothAnimation();
         } else if (webView != null && webView.canGoBack()) {
             goBackWithSmoothAnimation();
         } else if (!siteHistoryStack.isEmpty()) {
@@ -6999,7 +7211,6 @@ public class HomeActivity extends AppCompatActivity {
                 dismissPopupWithAnimation(dialog, root, () -> {
                     sessionAlive = false;
                     sessionUnlocked = false;
-                    resetAllWebViewsToSiteHome();
                     saveSitesToPrefs();
                     CookieManager.getInstance().flush();
                     if (isDlRunning) {
