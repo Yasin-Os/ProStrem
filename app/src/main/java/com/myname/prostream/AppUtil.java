@@ -1,5 +1,6 @@
 package com.myname.prostream;
 
+import android.content.Context;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 
@@ -10,7 +11,12 @@ import java.util.Locale;
 /** Shared small helpers: safe color parsing and PIN storage.
  *  The PIN is never stored in plaintext: SHA-256(salt + ":" + pin) with a
  *  per-install random salt. Legacy plaintext values are migrated to a hash
- *  on the next successful unlock, then deleted. */
+ *  on the next successful unlock, then deleted.
+ *
+ *  PIN সংক্রান্ত সবকিছু (হ্যাশ, সল্ট, ব্যর্থ চেষ্টা, লকআউট) আলাদা prefs
+ *  ফাইলে (ProStreamLockPrefs) থাকে — ব্যাকআপ থেকে সেটা বাদ দেওয়া হয়
+ *  (backup_rules.xml / data_extraction_rules.xml), তাই আনইনস্টল করে
+ *  আবার বসালে ভুলে যাওয়া PIN ফিরে আসে না। */
 public final class AppUtil {
 
     private AppUtil() {}
@@ -25,19 +31,50 @@ public final class AppUtil {
 
     // ---- App lock PIN ----
 
+    private static final String LOCK_PREFS_NAME = "ProStreamLockPrefs";
+    private static final String MAIN_PREFS_NAME = "ProStreamPrefs";
+
     private static final String KEY_PIN_HASH = "APP_PASSWORD_HASH";
     private static final String KEY_PIN_SALT = "APP_PASSWORD_SALT";
     private static final String KEY_PIN_FAILS = "PIN_FAIL_COUNT";
     private static final String KEY_PIN_LOCKOUT_UNTIL = "PIN_LOCKOUT_UNTIL";
     private static final int MAX_PIN_ATTEMPTS = 5;
 
+    /** PIN-এর prefs — প্রথমবার পুরোনো জায়গা (ProStreamPrefs) থেকে PIN-এর
+     *  চাবিগুলো এখানে সরিয়ে আনা হয়, তারপর আর সেখানে থাকে না। */
+    public static SharedPreferences lockPrefs(Context ctx) {
+        SharedPreferences lock = ctx.getSharedPreferences(LOCK_PREFS_NAME, Context.MODE_PRIVATE);
+        migratePinFromMainPrefs(ctx, lock);
+        return lock;
+    }
+
+    private static void migratePinFromMainPrefs(Context ctx, SharedPreferences lock) {
+        SharedPreferences main = ctx.getSharedPreferences(MAIN_PREFS_NAME, Context.MODE_PRIVATE);
+        if (!main.contains(KEY_PIN_HASH) && !main.contains(KEY_PIN_SALT)
+                && !main.contains("APP_PASSWORD") && !main.contains(KEY_PIN_FAILS)
+                && !main.contains(KEY_PIN_LOCKOUT_UNTIL)) {
+            return;
+        }
+        SharedPreferences.Editor lockEd = lock.edit();
+        if (main.contains(KEY_PIN_HASH)) lockEd.putString(KEY_PIN_HASH, main.getString(KEY_PIN_HASH, ""));
+        if (main.contains(KEY_PIN_SALT)) lockEd.putString(KEY_PIN_SALT, main.getString(KEY_PIN_SALT, ""));
+        if (main.contains("APP_PASSWORD")) lockEd.putString("APP_PASSWORD", main.getString("APP_PASSWORD", ""));
+        if (main.contains(KEY_PIN_FAILS)) lockEd.putInt(KEY_PIN_FAILS, main.getInt(KEY_PIN_FAILS, 0));
+        if (main.contains(KEY_PIN_LOCKOUT_UNTIL)) lockEd.putLong(KEY_PIN_LOCKOUT_UNTIL, main.getLong(KEY_PIN_LOCKOUT_UNTIL, 0));
+        lockEd.apply();
+        main.edit().remove(KEY_PIN_HASH).remove(KEY_PIN_SALT).remove("APP_PASSWORD")
+                .remove(KEY_PIN_FAILS).remove(KEY_PIN_LOCKOUT_UNTIL).apply();
+    }
+
     /** True if a PIN has ever been set (hashed or legacy plaintext). */
-    public static boolean hasPin(SharedPreferences prefs) {
+    public static boolean hasPin(Context ctx) {
+        SharedPreferences prefs = lockPrefs(ctx);
         return prefs.contains(KEY_PIN_HASH) || prefs.contains("APP_PASSWORD");
     }
 
     /** Store a PIN as a salted hash and drop any legacy plaintext value. */
-    public static void savePin(SharedPreferences prefs, String pin) {
+    public static void savePin(Context ctx, String pin) {
+        SharedPreferences prefs = lockPrefs(ctx);
         String salt = generateSalt();
         String hash = sha256Hex(salt + ":" + pin);
         prefs.edit()
@@ -49,7 +86,8 @@ public final class AppUtil {
     }
 
     /** Verify a PIN. Returns false while locked out. Migrates legacy plaintext on success. */
-    public static boolean verifyPin(SharedPreferences prefs, String input) {
+    public static boolean verifyPin(Context ctx, String input) {
+        SharedPreferences prefs = lockPrefs(ctx);
         if (isPinLockedOut(prefs)) return false;
         String hash = prefs.getString(KEY_PIN_HASH, null);
         if (hash != null) {
@@ -63,23 +101,27 @@ public final class AppUtil {
         }
         String legacy = prefs.getString("APP_PASSWORD", null);
         if (legacy != null && legacy.equals(input)) {
-            savePin(prefs, input);
+            savePin(ctx, input);
             return true;
         }
         if (legacy != null) recordPinFailure(prefs);
         return false;
     }
 
-    public static boolean isPinLockedOut(SharedPreferences prefs) {
+    public static boolean isPinLockedOut(Context ctx) {
+        return System.currentTimeMillis() < lockPrefs(ctx).getLong(KEY_PIN_LOCKOUT_UNTIL, 0);
+    }
+
+    public static long pinLockoutRemainingMs(Context ctx) {
+        return Math.max(0, lockPrefs(ctx).getLong(KEY_PIN_LOCKOUT_UNTIL, 0) - System.currentTimeMillis());
+    }
+
+    public static int pinFailuresLeft(Context ctx) {
+        return Math.max(0, MAX_PIN_ATTEMPTS - lockPrefs(ctx).getInt(KEY_PIN_FAILS, 0));
+    }
+
+    private static boolean isPinLockedOut(SharedPreferences prefs) {
         return System.currentTimeMillis() < prefs.getLong(KEY_PIN_LOCKOUT_UNTIL, 0);
-    }
-
-    public static long pinLockoutRemainingMs(SharedPreferences prefs) {
-        return Math.max(0, prefs.getLong(KEY_PIN_LOCKOUT_UNTIL, 0) - System.currentTimeMillis());
-    }
-
-    public static int pinFailuresLeft(SharedPreferences prefs) {
-        return Math.max(0, MAX_PIN_ATTEMPTS - prefs.getInt(KEY_PIN_FAILS, 0));
     }
 
     private static void recordPinFailure(SharedPreferences prefs) {
