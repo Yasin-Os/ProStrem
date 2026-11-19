@@ -34,6 +34,17 @@ jobs:
           XML_EOF
           cat app/src/main/res/values/strings.xml
 
+      - name: Set versionCode and versionName from run number
+        shell: bash
+        env:
+          RUN_NUM: ${{ github.run_number }}
+        run: |
+          sed -i "s/^versionCode = .*/versionCode = ${RUN_NUM}/" app/module.toml
+          sed -i "s/^versionName = .*/versionName = \"2.0.${RUN_NUM}\"/" app/module.toml
+          grep -q "^versionCode = ${RUN_NUM}$" app/module.toml || { echo "versionCode was not updated!"; exit 1; }
+          grep -q "^versionName = \"2.0.${RUN_NUM}\"$" app/module.toml || { echo "versionName was not updated!"; exit 1; }
+          grep -E "^version(Code|Name) =" app/module.toml
+
       - name: Build Android APK
         uses: tyron12233/CodeAssist@046e3cc98deaffa644c0211b275e69a48fcac3a2 # pinned 2026-11-16
         with:
