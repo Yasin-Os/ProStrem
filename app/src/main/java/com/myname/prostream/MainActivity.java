@@ -63,6 +63,9 @@ public class MainActivity extends AppCompatActivity {
     private final Handler typoHandler = new Handler(Looper.getMainLooper());
     // Forgot-PIN ফ্লোতে বায়োমেট্রিক ব্যবহার হচ্ছে কি না (সাধারণ আনলক থেকে আলাদা)
     private boolean biometricResetMode = false;
+    // PIN সেট করার অফার থেকে AppLock-এ গিয়ে ফিরে আসা হয়েছে কি না —
+    // ফিরে এসে PIN না থাকলে হোমে যাওয়া হয় (অন্যথায় ফাঁকা স্প্ল্যাশে আটকে যেতো)
+    private boolean returningFromPinSetup = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -78,7 +81,7 @@ public class MainActivity extends AppCompatActivity {
 
         // যদি লক বন্ধ থাকে এবং HomeActivity ইতিমধ্যে সচল থাকে, তবে রিলোড ছাড়াই সরাসরি আগের পেজে নিয়ে যাবে
         // PIN কখনো সেট করা না হয়ে থাকলে (নতুন ইনস্টল) লক স্ক্রিন দেখিয়ে আটকে রাখা যাবে না
-        if ((lockType == 0 || !AppUtil.hasPin(sharedPrefs)) && HomeActivity.isSessionAlive()) {
+        if ((lockType == 0 || !AppUtil.hasPin(this)) && HomeActivity.isSessionAlive()) {
             goToHome();
             return;
         }
@@ -125,8 +128,8 @@ public class MainActivity extends AppCompatActivity {
         // M1: লক না থাকলে ১২৫০ms স্প্ল্যাশ অপেক্ষা নেই — সরাসরি হোমে যাওয়া হয়।
         // লক থাকলে শুধু ~৩৫০ms রিভিল অপেক্ষা। প্রথমবার PIN সেট না থাকলে
         // একবার PIN সেট করার প্রস্তাব দেখানো হয় (M8)।
-        final boolean needsLock = lockType != 0 && AppUtil.hasPin(sharedPrefs);
-        if (!needsLock && !AppUtil.hasPin(sharedPrefs) && lockType != 0
+        final boolean needsLock = lockType != 0 && AppUtil.hasPin(this);
+        if (!needsLock && !AppUtil.hasPin(this) && lockType != 0
                 && !sharedPrefs.getBoolean("PIN_OFFER_SHOWN", false)) {
             typoHandler.postDelayed(this::showPinSetupOfferDialog, 350);
         } else if (!needsLock) {
@@ -144,6 +147,21 @@ public class MainActivity extends AppCompatActivity {
         }
         if (fingerprintIcon != null) {
             fingerprintIcon.setOnClickListener(v -> showNativeBiometricPrompt());
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (returningFromPinSetup) {
+            returningFromPinSetup = false;
+            if (AppUtil.hasPin(this)) {
+                // PIN সেট হয়েছে — লক স্ক্রিন দেখিয়ে আনলক করতে দেওয়া হয়
+                typoHandler.postDelayed(this::revealLockScreenSmoothly, 350);
+            } else {
+                // PIN না বসিয়ে ফিরে এসেছে — হোমে যাওয়া হয়
+                goToHome();
+            }
         }
     }
 
@@ -173,9 +191,11 @@ public class MainActivity extends AppCompatActivity {
         // M2: বায়োমেট্রিক প্রম্পট নিজে থেকে খোলা হয় না — ব্যবহারকারী
         // ফিঙ্গারপ্রিন্ট বোতাম চাপলেই খুলবে। M3: SDK < 28-এ বোতাম লুকানো থাকে।
         // A4: USE_BIOMETRIC ডিফল্ট false (নতুন ইনস্টলে অপ্ট-ইন)।
+        // বায়োমেট্রিক এনরোল করা না থাকলে বোতাম দেখিয়ে লাভ নেই — চাপলে
+        // শুধু "কাজ করেনি" টোস্ট আসতো।
         boolean useBiometric = sharedPrefs.getBoolean("USE_BIOMETRIC", false);
         if (fingerprintLayout != null) {
-            if (useBiometric && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            if (useBiometric && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && isBiometricEnrolledApi29()) {
                 fingerprintLayout.setVisibility(View.VISIBLE);
                 fingerprintLayout.setAlpha(0f);
                 fingerprintLayout.animate().alpha(1f).setDuration(300).start();
@@ -437,12 +457,18 @@ public class MainActivity extends AppCompatActivity {
 
     private void attemptLogin() {
         String inputPassword = passwordInput != null ? passwordInput.getText().toString().trim() : "";
-        if (AppUtil.isPinLockedOut(sharedPrefs)) {
-            long secs = AppUtil.pinLockoutRemainingMs(sharedPrefs) / 1000 + 1;
+        if (AppUtil.isPinLockedOut(this)) {
+            long secs = AppUtil.pinLockoutRemainingMs(this) / 1000 + 1;
             Toast.makeText(MainActivity.this, "অনেক ভুল চেষ্টা! " + secs + " সেকেন্ড পরে আবার চেষ্টা করুন।", Toast.LENGTH_SHORT).show();
             return;
         }
-        if (AppUtil.verifyPin(sharedPrefs, inputPassword)) {
+        // খালি PIN চাপলে ব্যর্থ চেষ্টা হিসেবে গোনা যাবে না — ৫ বার খালি
+        // চাপলেই ৩০ সেকেন্ড লকআউট হতো
+        if (inputPassword.isEmpty()) {
+            showPinError("PIN লিখুন");
+            return;
+        }
+        if (AppUtil.verifyPin(this, inputPassword)) {
             clearPinError();
             goToHome();
         } else {
@@ -453,7 +479,7 @@ public class MainActivity extends AppCompatActivity {
             }
             // M4: ভুল PIN মুছে ফেলা হয় + কার্ডে স্থায়ী এরর দেখানো হয়; M7: বাংলায়
             if (passwordInput != null) passwordInput.setText("");
-            int left = AppUtil.pinFailuresLeft(sharedPrefs);
+            int left = AppUtil.pinFailuresLeft(this);
             String msg = left > 0
                     ? "ভুল PIN! আর " + left + " বার চেষ্টা করা যাবে।"
                     : "ভুল PIN! কিছুক্ষণ পরে আবার চেষ্টা করুন।";
@@ -519,8 +545,8 @@ public class MainActivity extends AppCompatActivity {
         setBtn.setOnClickListener(v -> {
             dialog.dismiss();
             sharedPrefs.edit().putBoolean("PIN_OFFER_SHOWN", true).apply();
+            returningFromPinSetup = true;
             startActivity(new Intent(MainActivity.this, AppLockActivity.class));
-            finish();
         });
         LinearLayout.LayoutParams setBtnParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
