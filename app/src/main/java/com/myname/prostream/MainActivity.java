@@ -3,12 +3,15 @@ package com.myname.prostream;
 import android.animation.ObjectAnimator;
 import android.animation.PropertyValuesHolder;
 import android.animation.ValueAnimator;
+import android.app.Dialog;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.net.Uri;
 import android.content.res.ColorStateList;
 import android.graphics.Color;
+import android.graphics.Typeface;
+import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 import android.hardware.biometrics.BiometricManager;
 import android.hardware.biometrics.BiometricPrompt;
@@ -21,7 +24,9 @@ import android.provider.Settings;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
+import android.view.Gravity;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
@@ -30,6 +35,7 @@ import android.view.animation.OvershootInterpolator;
 import android.webkit.CookieManager;
 import android.widget.EditText;
 import android.widget.ImageView;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -456,23 +462,100 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // M8: প্রথমবার PIN না থাকলে একবারই PIN সেট করার প্রস্তাব
+    // M8: প্রথমবার PIN না থাকলে একবারই PIN সেট করার প্রস্তাব — গ্লাসি কার্ড
     private void showPinSetupOfferDialog() {
         if (isFinishing()) return;
-        new AlertDialog.Builder(this)
-                .setTitle("PIN লক সেট করবেন?")
-                .setMessage("অ্যাপে PIN লক চালু করলে অন্য কেউ আপনার অ্যাপ খুলতে পারবে না। এখনই সেট করবেন?")
-                .setPositiveButton("এখনই সেট করুন", (dialog, which) -> {
-                    sharedPrefs.edit().putBoolean("PIN_OFFER_SHOWN", true).apply();
-                    startActivity(new Intent(MainActivity.this, AppLockActivity.class));
-                    finish();
-                })
-                .setNegativeButton("এখন নয়", (dialog, which) -> {
-                    sharedPrefs.edit().putBoolean("PIN_OFFER_SHOWN", true).apply();
-                    goToHome();
-                })
-                .setCancelable(false)
-                .show();
+        final Dialog dialog = new Dialog(this);
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        dialog.setCancelable(false);
+
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setGravity(Gravity.CENTER_HORIZONTAL);
+        int pad = dpToPx(24);
+        card.setPadding(pad, pad, pad, pad);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setShape(GradientDrawable.RECTANGLE);
+        bg.setColor(Color.parseColor("#D91B2438"));
+        bg.setCornerRadius(dpToPx(24));
+        bg.setStroke(dpToPx(1), Color.parseColor("#4DFFFFFF"));
+        card.setBackground(bg);
+
+        TextView icon = new TextView(this);
+        icon.setText("\uD83D\uDD12");
+        icon.setTextSize(34f);
+        icon.setGravity(Gravity.CENTER);
+        icon.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        card.addView(icon);
+
+        TextView title = new TextView(this);
+        title.setText("PIN লক সেট করবেন?");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(19f);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        title.setGravity(Gravity.CENTER);
+        title.setPadding(0, dpToPx(12), 0, dpToPx(8));
+        title.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        card.addView(title);
+
+        TextView msg = new TextView(this);
+        msg.setText("অ্যাপে PIN লক চালু করলে অন্য কেউ আপনার অ্যাপ খুলতে পারবে না। এখনই সেট করবেন?");
+        msg.setTextColor(Color.parseColor("#C7D2E0"));
+        msg.setTextSize(14f);
+        msg.setGravity(Gravity.CENTER);
+        msg.setPadding(0, 0, 0, dpToPx(20));
+        msg.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        card.addView(msg);
+
+        MaterialButton setBtn = new MaterialButton(this);
+        setBtn.setText("এখনই সেট করুন");
+        setBtn.setBackgroundColor(Color.parseColor("#00F5A0"));
+        setBtn.setTextColor(Color.parseColor("#06101E"));
+        setBtn.setCornerRadius(dpToPx(12));
+        setBtn.setAllCaps(false);
+        setBtn.setOnClickListener(v -> {
+            dialog.dismiss();
+            sharedPrefs.edit().putBoolean("PIN_OFFER_SHOWN", true).apply();
+            startActivity(new Intent(MainActivity.this, AppLockActivity.class));
+            finish();
+        });
+        LinearLayout.LayoutParams setBtnParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        setBtnParams.bottomMargin = dpToPx(10);
+        setBtn.setLayoutParams(setBtnParams);
+        card.addView(setBtn);
+
+        MaterialButton laterBtn = new MaterialButton(this);
+        laterBtn.setText("এখন নয়");
+        laterBtn.setBackgroundColor(Color.TRANSPARENT);
+        laterBtn.setTextColor(Color.parseColor("#7DD3FC"));
+        laterBtn.setCornerRadius(dpToPx(12));
+        laterBtn.setStrokeColor(ColorStateList.valueOf(Color.parseColor("#4D7DD3FC")));
+        laterBtn.setStrokeWidth(dpToPx(1));
+        laterBtn.setAllCaps(false);
+        laterBtn.setOnClickListener(v -> {
+            dialog.dismiss();
+            sharedPrefs.edit().putBoolean("PIN_OFFER_SHOWN", true).apply();
+            goToHome();
+        });
+        laterBtn.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        card.addView(laterBtn);
+
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setOrientation(LinearLayout.VERTICAL);
+        int side = dpToPx(24);
+        wrap.setPadding(side, 0, side, 0);
+        wrap.addView(card, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        dialog.setContentView(wrap);
+        if (dialog.getWindow() != null) {
+            dialog.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        }
+        dialog.show();
     }
 
     // M5: PIN ভুলে গেলে — বায়োমেট্রিক থাকলে তা দিয়ে নতুন PIN, না থাকলে ডেটা মোছার পথ
