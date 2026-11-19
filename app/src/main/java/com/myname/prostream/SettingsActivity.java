@@ -393,7 +393,7 @@ public class SettingsActivity extends AppCompatActivity {
         String lockState = lockType == 0 ? "লক বন্ধ আছে"
                 : (AppUtil.hasPin(this) ? "PIN লক চালু আছে" : "লক চালু আছে (PIN সেট হয়নি)");
         setCardSubtitle(cardAppLock, lockState);
-        setCardSubtitle(cardSmartDNS, "হোস্ট: p2.freedns.controld.com");
+        setCardSubtitle(cardSmartDNS, "Private DNS-এ এই হোস্ট বসান");
     }
 
     private String siteCountText() {
@@ -433,8 +433,8 @@ public class SettingsActivity extends AppCompatActivity {
     }
 
     private void applyThemeColor() {
-        String hex = prefs.getString("APP_COLOR", "#0D9488");
-        int color = AppUtil.parseColorSafe(hex, Color.parseColor("#0D9488"));
+        String hex = prefs.getString("APP_COLOR", "#00F5A0");
+        int color = AppUtil.parseColorSafe(hex, Color.parseColor("#00F5A0"));
 
         getWindow().setStatusBarColor(color);
         toolbarSettings.setTitleTextColor(color);
