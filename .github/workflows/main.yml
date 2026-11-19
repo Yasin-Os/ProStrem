@@ -35,7 +35,7 @@ jobs:
           cat app/src/main/res/values/strings.xml
 
       - name: Build Android APK
-        uses: tyron12233/CodeAssist@main
+        uses: tyron12233/CodeAssist@046e3cc98deaffa644c0211b275e69a48fcac3a2 # pinned 2026-11-16
         with:
           variant: debug
           artifact-name: ProStream-debug
@@ -71,8 +71,8 @@ jobs:
         shell: bash
         run: |
           if [ -z "$KEYSTORE_BASE64" ]; then
-            echo "No release keystore configured — keeping debug signature."
-            exit 0
+            echo "ERROR: No release keystore configured — refusing to ship a debug-signed release."
+            exit 1
           fi
           echo "$KEYSTORE_BASE64" | base64 -d > /tmp/release.keystore
           APKSIGNER=""
@@ -82,9 +82,9 @@ jobs:
             if [ -n "$FOUND" ]; then APKSIGNER="$FOUND"; break; fi
           done
           if [ -z "$APKSIGNER" ]; then
-            echo "apksigner not found — keeping debug signature."
+            echo "ERROR: apksigner not found — cannot sign the release."
             rm -f /tmp/release.keystore
-            exit 0
+            exit 1
           fi
           "$APKSIGNER" sign --ks /tmp/release.keystore --ks-pass "pass:$KEY_STORE_PASSWORD" --key-pass "pass:$KEY_PASSWORD" --ks-key-alias "$KEY_ALIAS" --out /tmp/ProStream-signed.apk ./ProStream.apk
           "$APKSIGNER" verify --verbose /tmp/ProStream-signed.apk
