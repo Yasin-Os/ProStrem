@@ -46,6 +46,7 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.SystemClock;
 import android.provider.MediaStore;
 import android.provider.Settings;
 import android.text.InputType;
@@ -291,6 +292,12 @@ public class HomeActivity extends AppCompatActivity {
 
     private final Map<String, WebView> webViewPool = new HashMap<>();
     private final Map<WebView, String> lastFailedUrlMap = new HashMap<>();
+    // SSL এরর লুপ ঠেকানো: একই URL-র SSL টোস্ট ১৫ সেকেন্ডে একবারের বেশি নয়,
+    // আর SSL-তে মরা পেজ onResume-এ নিজে থেকে রিলোড হবে না
+    private String lastSslToastUrl = null;
+    private long lastSslToastTimeMs = 0;
+    private String lastMainFrameNavUrl = null;
+    private boolean lastMainFrameFailedSsl = false;
     private final Set<WebView> clearHistoryOnLoadSet = Collections.synchronizedSet(new HashSet<>());
     private final Set<String> fetchingOgUrls = Collections.synchronizedSet(new HashSet<>());
 
@@ -4248,6 +4255,8 @@ public class HomeActivity extends AppCompatActivity {
                 videoDetectedToastShownForPage = false;
                 if (url != null && !url.startsWith("about:blank")) {
                     if (view == webView) {
+                        lastMainFrameNavUrl = url;
+                        lastMainFrameFailedSsl = false;
                         hideModernOfflineScreen();
                     }
                 }
@@ -4287,7 +4296,7 @@ public class HomeActivity extends AppCompatActivity {
                         if (progressBar != null) progressBar.setVisibility(View.GONE);
                         showModernOfflineScreen(failingUrl);
                     }
-                } else if (view == webView && !isCloudflareChallengePage(view) && isSiteDownError(errCode, errDesc)) {
+                } else if (view == webView && !lastMainFrameFailedSsl && !isCloudflareChallengePage(view) && isSiteDownError(errCode, errDesc)) {
                     String failingUrl = request.getUrl() != null ? request.getUrl().toString() : "";
                     if (failingUrl.startsWith("http")) {
                         lastFailedUrlMap.put(view, failingUrl);
@@ -4340,8 +4349,29 @@ public class HomeActivity extends AppCompatActivity {
                 if (handler != null) {
                     handler.cancel();
                 }
+                // শুধু চালু WebView-র মূল পেজের এররেই জানানো হয়। সাব-রিসোর্স
+                // (বিজ্ঞাপন/ট্র্যাকার) এররে পেজ ঠিকই চলে, তাই সেখানে টোস্ট নয় —
+                // নইলে এক পেজেই অনেক টোস্ট জমে অ্যাপ ছাড়ার পরও দেখাতে থাকে।
+                if (view != webView) return;
+                String failingUrl = error != null && error.getUrl() != null ? error.getUrl() : "";
+                boolean isMainFrame = !failingUrl.isEmpty()
+                        && (failingUrl.equals(lastMainFrameNavUrl)
+                        || (currentSite != null && failingUrl.startsWith(currentSite.getEffectiveUrl())));
+                if (!isMainFrame) return;
+                lastMainFrameFailedSsl = true;
+                if (failingUrl.startsWith("http")) {
+                    lastFailedUrlMap.put(view, failingUrl);
+                }
+                // একই URL-র টোস্ট ১৫ সেকেন্ডে একবারের বেশি নয়
+                long now = SystemClock.elapsedRealtime();
+                if (failingUrl.equals(lastSslToastUrl) && now - lastSslToastTimeMs < 15000) return;
+                lastSslToastUrl = failingUrl;
+                lastSslToastTimeMs = now;
                 Toast.makeText(HomeActivity.this,
                         "নিরাপদ সংযোগ যাচাই করা যায়নি — পেজটি খোলা হয়নি।", Toast.LENGTH_LONG).show();
+                if (swipeRefresh != null) swipeRefresh.setRefreshing(false);
+                if (progressBar != null) progressBar.setVisibility(View.GONE);
+                showModernOfflineScreen(failingUrl, "নিরাপদ সংযোগ হয়নি");
             }
 
             @Override
@@ -6281,7 +6311,8 @@ public class HomeActivity extends AppCompatActivity {
         startFloatingHubBreathingAnimation();
         startNotificationProgressTrackerStatic(appContextRef);
         applyDynamicTheme();
-        if (modernOfflineOverlay != null && modernOfflineOverlay.getVisibility() == View.VISIBLE && isNetworkAvailable()) {
+        // SSL-তে মরা পেজ নিজে থেকে রিলোড নয় — একই এরর বারবার টোস্ট হবে; ব্যবহারকারী Retry চাপলে তবেই রিলোড
+        if (modernOfflineOverlay != null && modernOfflineOverlay.getVisibility() == View.VISIBLE && isNetworkAvailable() && !lastMainFrameFailedSsl) {
             reloadActivePageCleanly();
         }
         reloadSitesIfChanged();
