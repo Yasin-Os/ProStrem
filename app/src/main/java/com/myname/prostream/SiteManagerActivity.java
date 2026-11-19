@@ -13,6 +13,7 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.SeekBar;
 import android.widget.TextView;
+import android.widget.Toast;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import com.google.android.material.appbar.MaterialToolbar;
@@ -25,6 +26,9 @@ public class SiteManagerActivity extends AppCompatActivity {
 
     private SharedPreferences prefs;
     private JSONArray sitesArray;
+    // পুরো SITES_JSON নষ্ট থাকলে true — তখন সেভ আটকে দেওয়া হয়, যাতে
+    // নতুন সাইট যোগ করতে গিয়ে পুরোনো ডেটা মুছে না যায়
+    private boolean sitesLoadFailed = false;
 
     private MaterialToolbar toolbarSites;
     private LinearLayout sitesContainer;
@@ -51,9 +55,20 @@ public class SiteManagerActivity extends AppCompatActivity {
 
     private void loadSites() {
         sitesContainer.removeAllViews();
+        sitesLoadFailed = false;
         try {
             String jsonStr = prefs.getString("SITES_JSON", "[]");
-            sitesArray = new JSONArray(jsonStr);
+            JSONArray raw = new JSONArray(jsonStr);
+            sitesArray = new JSONArray();
+            for (int i = 0; i < raw.length(); i++) {
+                try {
+                    JSONObject site = raw.getJSONObject(i);
+                    if (site.optString("url", "").trim().isEmpty()) continue;
+                    sitesArray.put(site);
+                } catch (Exception ignored) {
+                    // একটা নষ্ট এন্ট্রি পরের সব সাইট মুছে দেবে না
+                }
+            }
 
             for (int i = 0; i < sitesArray.length(); i++) {
                 final int index = i;
@@ -136,8 +151,11 @@ public class SiteManagerActivity extends AppCompatActivity {
             }
         } catch (Exception e) {
             e.printStackTrace();
-            // SM9: সেভ ডেটা নষ্ট থাকলে খালি তালিকা ধরা হয় — ক্র্যাশ নয়
+            // পুরো তালিকাই নষ্ট — খালি দেখানো হয়, তবে পরের সেভে পুরোনো
+            // ডেটা মুছে যাবে না (sitesLoadFailed দেখে সেভ আটকে দেওয়া হয়)
             sitesArray = new JSONArray();
+            sitesLoadFailed = true;
+            Toast.makeText(this, "সাইটের তালিকা পড়া যায়নি — Settings থেকে ব্যাকআপ রিস্টোর করুন", Toast.LENGTH_LONG).show();
         }
         // SM6: সাইট না থাকলে নির্দেশনা দেখানো হয়
         if (sitesArray == null) sitesArray = new JSONArray();
@@ -267,12 +285,13 @@ public class SiteManagerActivity extends AppCompatActivity {
                 showDialogError(tvDialogError, "সঠিক URL লিখুন (যেমন https://example.com)");
                 return;
             }
-            // SM3: ডুপ্লিকেট চেক — স্কিম/www/শেষের স্ল্যাশ উপেক্ষা করে (নিজের এন্ট্রি বাদে)
-            String normUrl = normalizeSiteUrl(url);
+            // SM3: ডুপ্লিকেট চেক — স্কিম/www/শেষের স্ল্যাশ/পোর্ট/পাথ উপেক্ষা
+            // করে (নিজের এন্ট্রি বাদে)
+            String dupKey = duplicateKeyForUrl(url);
             try {
                 for (int i = 0; i < sitesArray.length(); i++) {
                     if (i == index) continue;
-                    if (normUrl.equals(normalizeSiteUrl(sitesArray.getJSONObject(i).optString("url", "")))) {
+                    if (dupKey.equals(duplicateKeyForUrl(sitesArray.getJSONObject(i).optString("url", "")))) {
                         showDialogError(tvDialogError, "এই URL already আছে!");
                         return;
                     }
@@ -294,6 +313,10 @@ public class SiteManagerActivity extends AppCompatActivity {
                     sitesArray.put(index, obj);
                 }
 
+                if (sitesLoadFailed) {
+                    showDialogError(tvDialogError, "তালিকা নষ্ট — প্রথমে Settings থেকে ব্যাকআপ রিস্টোর করুন");
+                    return;
+                }
                 prefs.edit().putString("SITES_JSON", sitesArray.toString()).apply();
                 loadSites();
                 dialog.dismiss();
@@ -345,6 +368,17 @@ public class SiteManagerActivity extends AppCompatActivity {
         else if (s.startsWith("https://")) s = s.substring(8);
         if (s.startsWith("www.")) s = s.substring(4);
         while (s.endsWith("/")) s = s.substring(0, s.length() - 1);
+        return s;
+    }
+
+    // ডুপ্লিকেট চেকের চাবি — পোর্ট/পাথও বাদ, নইলে example.com,
+    // example.com:8080, example.com/path আলাদা সাইট ধরা হতো
+    private static String duplicateKeyForUrl(String url) {
+        String s = normalizeSiteUrl(url);
+        int colon = s.indexOf(':');
+        if (colon >= 0) s = s.substring(0, colon);
+        int slash = s.indexOf('/');
+        if (slash >= 0) s = s.substring(0, slash);
         return s;
     }
 
