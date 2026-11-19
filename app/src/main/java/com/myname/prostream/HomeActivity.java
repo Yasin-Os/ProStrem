@@ -159,6 +159,10 @@ public class HomeActivity extends AppCompatActivity {
     private static final String ACTION_CANCEL_DL = "com.myname.prostream.ACTION_CANCEL_DL";
     private static final String PREF_DL_IDS_KEY = "PROSTREAM_ONLY_DL_IDS_V3";
     private static final String PREF_DL_HISTORY_KEY = "PROSTREAM_ONLY_HISTORY_V3";
+    // চলমান/থেমে থাকা/ব্যর্থ কাস্টম ডাউনলোডের বর্ণনা — অ্যাপ মরলে আবার
+    // ফিরিয়ে আনার জন্য (সফলগুলো আলাদা হিস্ট্রি রেকর্ডে থাকে)
+    private static final String PREF_CUSTOM_DL_TASKS_KEY = "CUSTOM_DL_TASKS_V1";
+    private static long lastDlPersistMs = 0;
     private static final int FILE_CHOOSER_REQUEST_CODE = 802;
 
     private static final Handler bgDownloadHandler = new Handler(Looper.getMainLooper());
@@ -455,6 +459,39 @@ public class HomeActivity extends AppCompatActivity {
         } catch (Exception ignored) {}
     }
 
+    // চলমান/থেমে থাকা/ব্যর্থ ডাউনলোডের অবস্থা ডিস্কে লেখা — অ্যাপের প্রসেস
+    // মরলে (সোয়াইপ/রিবুট/সিস্টেম কিল) ডাউনলোড যেন তালিকা থেকে গায়েব না হয়
+    private static void persistCustomDownloadTasksStatic(Context ctx) {
+        if (ctx == null) return;
+        try {
+            JSONArray arr = new JSONArray();
+            for (CustomDownloadTask task : customTasksMap.values()) {
+                if (task.status == DownloadManager.STATUS_SUCCESSFUL || task.cancelled) continue;
+                JSONObject o = new JSONObject();
+                o.put("id", task.id);
+                o.put("title", task.title);
+                o.put("url", task.url);
+                o.put("referer", task.refererUrl);
+                o.put("out", task.outputFile.getAbsolutePath());
+                o.put("hls", task.isHls);
+                o.put("total", task.totalBytes);
+                o.put("done", task.downloadedBytes.get());
+                o.put("segs", task.completedSegments);
+                o.put("segTotal", task.totalSegments);
+                o.put("status", task.status);
+                o.put("err", task.errorMessage);
+                if (task.partProgress != null) {
+                    JSONArray pp = new JSONArray();
+                    for (long v : task.partProgress) pp.put(v);
+                    o.put("parts", pp);
+                }
+                arr.put(o);
+            }
+            ctx.getSharedPreferences("ProStreamPrefs", Context.MODE_PRIVATE)
+                    .edit().putString(PREF_CUSTOM_DL_TASKS_KEY, arr.toString()).apply();
+        } catch (Exception ignored) {}
+    }
+
     private static final Runnable staticLiveDownloadPoller = new Runnable() {
         @Override
         public void run() {
@@ -511,6 +548,7 @@ public class HomeActivity extends AppCompatActivity {
         if (savedIds != null) {
             trackedDownloadIds.addAll(savedIds);
         }
+        restoreCustomDownloadTasks();
         modernFont = Typeface.create("sans-serif-medium", Typeface.NORMAL);
 
         CookieManager cookieManager = CookieManager.getInstance();
@@ -873,6 +911,14 @@ public class HomeActivity extends AppCompatActivity {
         try {
             NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
             if (nm == null) return false;
+
+            // ডাউনলোডের অবস্থা ১৫ সেকেন্ডে একবার ডিস্কে লেখা — অ্যাপ মরলেও
+            // শেষ অবস্থা থেকে রিজিউম করা যায় (প্রতি সেকেন্ডে লিখলে I/O নষ্ট)
+            long nowPersistMs = System.currentTimeMillis();
+            if (nowPersistMs - lastDlPersistMs >= 15000) {
+                lastDlPersistMs = nowPersistMs;
+                persistCustomDownloadTasksStatic(ctx);
+            }
 
             for (CustomDownloadTask task : customTasksMap.values()) {
                 if (task.cancelled || task.status == DownloadManager.STATUS_FAILED) {
@@ -2805,6 +2851,98 @@ public class HomeActivity extends AppCompatActivity {
         });
     }
 
+    // আগের প্রসেসে চলমান/থেমে থাকা/ব্যর্থ ডাউনলোড ফিরিয়ে আনা — ফাইল থাকলে
+    // থেমে থাকা হিসেবে ফেরে (Resume চাপলে চলবে), ব্যর্থটা ব্যর্থই থাকে
+    private void restoreCustomDownloadTasks() {
+        String raw = sharedPrefs.getString(PREF_CUSTOM_DL_TASKS_KEY, "");
+        if (raw != null && !raw.isEmpty()) {
+            try {
+                JSONArray arr = new JSONArray(raw);
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject o = arr.optJSONObject(i);
+                    if (o == null) continue;
+                    long id = o.optLong("id", -1);
+                    String title = o.optString("title", "Video");
+                    String url = o.optString("url", "");
+                    String outPath = o.optString("out", "");
+                    if (id < 0 || url.isEmpty() || outPath.isEmpty()) continue;
+                    if (customTasksMap.containsKey(id)) continue; // লাইভ টাস্ক আছে (অ্যাক্টিভিটি আবার তৈরি হয়েছে) — সেটাই আসল
+                    File outFile = new File(outPath);
+                    if (!outFile.exists()) continue; // আধা ফাইল নেই — রিজিউম করার কিছু নেই
+                    boolean isHls = o.optBoolean("hls", false);
+                    CustomDownloadTask task = new CustomDownloadTask(id, title, url, outFile, isHls);
+                    task.refererUrl = o.optString("referer", "");
+                    task.totalBytes = o.optLong("total", -1);
+                    task.totalSegments = o.optInt("segTotal", 0);
+                    task.completedSegments = o.optInt("segs", 0);
+                    task.downloadedBytes.set(o.optLong("done", 0));
+                    task.errorMessage = o.optString("err", "");
+                    if (o.has("parts")) {
+                        JSONArray pp = o.optJSONArray("parts");
+                        if (pp != null) {
+                            task.partProgress = new long[pp.length()];
+                            for (int p = 0; p < pp.length(); p++) task.partProgress[p] = pp.optLong(p, 0);
+                        }
+                    }
+                    if (isHls) {
+                        // HLS-এ ফাইল শেষে জোড়া লাগে — শেষ সেভের পর লেখা
+                        // হিসাবের বাইরের লেজ কেটে ফেলা হয়, নইলে রিজিউমে
+                        // সেগমেন্ট ডুপ্লিকেট হয়ে ভিডিও নষ্ট হতো
+                        long persistedDone = task.downloadedBytes.get();
+                        if (outFile.length() > persistedDone) {
+                            truncateFileTo(outFile, persistedDone);
+                        } else if (outFile.length() < persistedDone) {
+                            task.completedSegments = 0;
+                            task.downloadedBytes.set(0);
+                            truncateFileTo(outFile, 0);
+                        }
+                    } else if (task.partProgress == null) {
+                        // সিঙ্গেল কানেকশনে ফাইল শুরু থেকে একটানা — আসল
+                        // দৈর্ঘ্যই সত্যি, সেখান থেকে রিজিউম হবে
+                        task.downloadedBytes.set(outFile.length());
+                    }
+                    int savedStatus = o.optInt("status", DownloadManager.STATUS_PAUSED);
+                    task.status = (savedStatus == DownloadManager.STATUS_FAILED)
+                            ? DownloadManager.STATUS_FAILED : DownloadManager.STATUS_PAUSED;
+                    task.paused = task.status == DownloadManager.STATUS_PAUSED;
+                    customTasksMap.put(id, task);
+                    trackedDownloadIds.add(String.valueOf(id));
+                }
+                sharedPrefs.edit().putStringSet(PREF_DL_IDS_KEY, new HashSet<>(trackedDownloadIds)).apply();
+            } catch (Exception ignored) {}
+        }
+        cleanupOrphanDownloadFiles();
+    }
+
+    private static void truncateFileTo(File f, long len) {
+        try {
+            RandomAccessFile raf = new RandomAccessFile(f, "rw");
+            raf.setLength(len);
+            raf.close();
+        } catch (Exception ignored) {}
+    }
+
+    // আগের প্রসেস মরে গেলে বা Clear চাপলে পড়ে থাকা আধা ফাইল মোছা —
+    // কোনো লাইভ/ফেরানো টাস্কের ফাইল নয় এমন সব ফাইল (আপডেট APK ছাড়া)
+    private void cleanupOrphanDownloadFiles() {
+        try {
+            File dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+            if (dir == null || !dir.exists()) return;
+            HashSet<String> keep = new HashSet<>();
+            for (CustomDownloadTask t : customTasksMap.values()) {
+                if (t.outputFile != null) keep.add(t.outputFile.getAbsolutePath());
+            }
+            File[] files = dir.listFiles();
+            if (files == null) return;
+            for (File f : files) {
+                if (f.isFile() && !keep.contains(f.getAbsolutePath())
+                        && !"ProStream_Update.apk".equals(f.getName())) {
+                    try { f.delete(); } catch (Exception ignored) {}
+                }
+            }
+        } catch (Exception ignored) {}
+    }
+
     private void startCustomStreamOrDirectDownload(final String mediaUrl, final String refererUrl, final String fileName, final boolean isHls) {
         // একই ভিডিওর ডাউনলোড ইতিমধ্যে চললে/থেমে থাকলে নতুন টাস্ক নয় —
         // ডাবল-ট্যাপে দুটো টাস্ক একই ফাইলে লিখে দুটোই নষ্ট করতো
@@ -2827,6 +2965,7 @@ public class HomeActivity extends AppCompatActivity {
         customTasksMap.put(taskId, task);
         trackedDownloadIds.add(String.valueOf(taskId));
         sharedPrefs.edit().putStringSet(PREF_DL_IDS_KEY, new HashSet<>(trackedDownloadIds)).apply();
+        persistCustomDownloadTasksStatic(appContextRef);
 
         startBackgroundDownloadKeeperService(appContextRef);
         acquireTurboDownloadBoosterStatic(appContextRef);
@@ -2847,6 +2986,7 @@ public class HomeActivity extends AppCompatActivity {
         if (task == null) return;
         task.paused = true;
         task.status = DownloadManager.STATUS_PAUSED;
+        persistCustomDownloadTasksStatic(appContextRef);
     }
 
     private void resumeDownloadTask(final CustomDownloadTask task) {
@@ -2858,6 +2998,7 @@ public class HomeActivity extends AppCompatActivity {
         startBackgroundDownloadKeeperService(appContextRef);
         acquireTurboDownloadBoosterStatic(appContextRef);
         startNotificationProgressTrackerStatic(appContextRef);
+        persistCustomDownloadTasksStatic(appContextRef);
         customDlExecutor.execute(() -> {
             if (task.isHls) {
                 executeHlsM3u8Download(task, task.refererUrl);
@@ -3534,11 +3675,19 @@ public class HomeActivity extends AppCompatActivity {
             Iterator<Map.Entry<Long, CustomDownloadTask>> it = customTasksMap.entrySet().iterator();
             while (it.hasNext()) {
                 Map.Entry<Long, CustomDownloadTask> entry = it.next();
-                if (entry.getValue().status != DownloadManager.STATUS_RUNNING) {
+                CustomDownloadTask t = entry.getValue();
+                if (t.status != DownloadManager.STATUS_RUNNING) {
+                    // আধা ফাইলও মোছা হয় — নইলে প্রাইভেট স্টোরেজে চিরতরে
+                    // পড়ে থাকতো (সফল ডাউনলোডের ফাইল ছোঁয়া হয় না)
+                    if (t.status != DownloadManager.STATUS_SUCCESSFUL
+                            && t.outputFile != null && t.outputFile.exists()) {
+                        try { t.outputFile.delete(); } catch (Exception ignored) {}
+                    }
                     it.remove();
                 }
             }
             sharedPrefs.edit().putString(PREF_DL_HISTORY_KEY, "[]").apply();
+            persistCustomDownloadTasksStatic(appContextRef);
             populateLiveDownloadsList(listContainer, dialog);
         });
 
@@ -6559,6 +6708,7 @@ public class HomeActivity extends AppCompatActivity {
         }
         saveSitesToPrefs();
         boolean hasActiveDl = updateLiveDownloadNotificationsAndSpeedStatic(appContextRef);
+        persistCustomDownloadTasksStatic(appContextRef);
         if (webView != null && !hasActiveDl) {
             webView.onPause();
         }
