@@ -139,9 +139,9 @@
                     app:boxCornerRadiusBottomStart="14dp"
                     app:boxCornerRadiusTopEnd="14dp"
                     app:boxCornerRadiusTopStart="14dp"
-                    app:boxStrokeColor="#00A884"
+                    app:boxStrokeColor="#00F5A0"
                     app:boxStrokeWidth="0dp"
-                    app:hintTextColor="#00A884"
+                    app:hintTextColor="#00F5A0"
                     app:passwordToggleEnabled="true"
                     app:passwordToggleTint="#94A3B8">
 
@@ -169,7 +169,7 @@
                     android:textColor="#FFFFFF"
                     android:textSize="13sp"
                     android:textStyle="bold"
-                    app:backgroundTint="#00A884"
+                    app:backgroundTint="#00F5A0"
                     app:cornerRadius="14dp" />
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
