@@ -5018,7 +5018,13 @@ public class HomeActivity extends AppCompatActivity {
     }
 
     private int getInstalledBuildNumber() {
-        int savedBuild = sharedPrefs.getInt("INSTALLED_BUILD_NUMBER_V6", -1);
+        // চলমান APK-র নিজের build_number-ই আসল ইনস্টল করা বিল্ড। আগে ইনস্টল
+        // শুরুর আগেই নতুন বিল্ড নম্বর সেভ করা হতো — ইনস্টলে "না" চাপলে বা
+        // ব্যর্থ হলে সেই ভুল মান থেকে যেত আর আপডেট আর কখনো আসতো না। তাই সেভ
+        // করা মান আর পড়া হয় না; পুরোনো ভুল মান থাকলে একবারে মুছে ফেলা হয়।
+        if (sharedPrefs.contains("INSTALLED_BUILD_NUMBER_V6")) {
+            sharedPrefs.edit().remove("INSTALLED_BUILD_NUMBER_V6").apply();
+        }
         int xmlBuild = 1;
         try {
             int resId = getResources().getIdentifier("build_number", "string", getPackageName());
@@ -5030,7 +5036,7 @@ public class HomeActivity extends AppCompatActivity {
                 }
             }
         } catch (Exception ignored) {}
-        return Math.max(savedBuild, xmlBuild);
+        return xmlBuild;
     }
 
     private String getInstalledVersionLabel() {
@@ -5531,10 +5537,10 @@ public class HomeActivity extends AppCompatActivity {
                     throw new Exception("Downloaded file is not a valid APK");
                 }
 
-                if (targetBuildNum > getInstalledBuildNumber()) {
-                    sharedPrefs.edit().putInt("INSTALLED_BUILD_NUMBER_V6", targetBuildNum).apply();
-                }
-
+                // ইনস্টল সফল না হতেই নতুন বিল্ড নম্বর সেভ করা যাবে না — সফল
+                // ইনস্টলের পর নতুন APK নিজেই তার build_number জানিয়ে দেয়।
+                // (আগে এখানে সেভ করা হতো, তাই ইনস্টলে "না" চাপলেও আপডেট
+                // আর কখনো আসতো না।)
                 mainHandler.post(() -> {
                     dismissPopupWithAnimation(progDialog, root, () -> installDownloadedUpdateApk(apkFile));
                 });
