@@ -876,6 +876,9 @@ public class HomeActivity extends AppCompatActivity {
 
             for (CustomDownloadTask task : customTasksMap.values()) {
                 if (task.cancelled || task.status == DownloadManager.STATUS_FAILED) {
+                    // ব্যর্থ ডাউনলোডের আটকে থাকা প্রোগ্রেস নোটিফিকেশন সরানো —
+                    // না সরালে মনে হয় ডাউনলোড এখনো চলছে
+                    nm.cancel((int) (Math.abs(task.id) % 100000L) + 4000);
                     continue;
                 }
                 if (task.status == DownloadManager.STATUS_RUNNING || task.status == DownloadManager.STATUS_PENDING) {
@@ -2666,7 +2669,7 @@ public class HomeActivity extends AppCompatActivity {
         return base;
     }
 
-    private File getSafeWritableDownloadFile(String fileName) {
+    private File getSafeWritableDownloadFile(String fileName, boolean unique) {
         File appDlDir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
         if (appDlDir == null) {
             appDlDir = getFilesDir();
@@ -2674,7 +2677,34 @@ public class HomeActivity extends AppCompatActivity {
         if (!appDlDir.exists()) {
             appDlDir.mkdirs();
         }
-        return new File(appDlDir, fileName);
+        File out = new File(appDlDir, fileName);
+        if (unique && out.exists()) {
+            // একই নামে নতুন ফাইল এলে আগেরটার ওপর লেখা যাবে না — দুটো
+            // ডাউনলোড একই ফাইলে লিখলে দুটোই নষ্ট হতো
+            String name = fileName;
+            String ext = "";
+            int dot = fileName.lastIndexOf('.');
+            if (dot > 0) {
+                name = fileName.substring(0, dot);
+                ext = fileName.substring(dot);
+            }
+            int n = 1;
+            while (out.exists() && n < 100) {
+                out = new File(appDlDir, name + " (" + n + ")" + ext);
+                n++;
+            }
+        }
+        return out;
+    }
+
+    private static String mimeTypeForFileName(String fileName) {
+        String lower = fileName != null ? fileName.toLowerCase(Locale.ROOT) : "";
+        if (lower.endsWith(".mkv")) return "video/x-matroska";
+        if (lower.endsWith(".webm")) return "video/webm";
+        if (lower.endsWith(".mp3")) return "audio/mpeg";
+        if (lower.endsWith(".zip")) return "application/zip";
+        if (lower.endsWith(".apk")) return "application/vnd.android.package-archive";
+        return "video/mp4";
     }
 
     private String exportCompletedFileToPublicDownloads(File sourceFile, String fileName) {
@@ -2684,30 +2714,41 @@ public class HomeActivity extends AppCompatActivity {
                 ContentResolver resolver = getApplicationContext().getContentResolver();
                 ContentValues values = new ContentValues();
                 values.put(MediaStore.Downloads.DISPLAY_NAME, fileName);
-                values.put(MediaStore.Downloads.MIME_TYPE, "video/mp4");
+                values.put(MediaStore.Downloads.MIME_TYPE, mimeTypeForFileName(fileName));
                 values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/ProStream");
                 values.put(MediaStore.Downloads.IS_PENDING, 1);
 
                 Uri collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
                 Uri itemUri = resolver.insert(collection, values);
                 if (itemUri != null) {
-                    OutputStream os = resolver.openOutputStream(itemUri);
-                    FileInputStream fis = new FileInputStream(sourceFile);
-                    if (os != null) {
-                        byte[] buf = new byte[128 * 1024];
-                        int r;
-                        while ((r = fis.read(buf)) != -1) {
-                            os.write(buf, 0, r);
+                    OutputStream os = null;
+                    FileInputStream fis = null;
+                    boolean ok = false;
+                    try {
+                        os = resolver.openOutputStream(itemUri);
+                        fis = new FileInputStream(sourceFile);
+                        if (os != null) {
+                            byte[] buf = new byte[128 * 1024];
+                            int r;
+                            while ((r = fis.read(buf)) != -1) {
+                                os.write(buf, 0, r);
+                            }
+                            os.flush();
+                            ContentValues doneValues = new ContentValues();
+                            doneValues.put(MediaStore.Downloads.IS_PENDING, 0);
+                            resolver.update(itemUri, doneValues, null, null);
+                            ok = true;
                         }
-                        os.flush();
-                        os.close();
+                    } catch (Throwable ignored) {
+                    } finally {
+                        try { if (os != null) os.close(); } catch (Exception ignored) {}
+                        try { if (fis != null) fis.close(); } catch (Exception ignored) {}
                     }
-                    fis.close();
-
-                    ContentValues doneValues = new ContentValues();
-                    doneValues.put(MediaStore.Downloads.IS_PENDING, 0);
-                    resolver.update(itemUri, doneValues, null, null);
-                    return itemUri.toString();
+                    if (ok) return itemUri.toString();
+                    // কপি ব্যর্থ হলে IS_PENDING=1 এন্ট্রি রেখে যাওয়া যাবে না —
+                    // না মুছলে Downloads-এ ০-বাইটের ভূতুড়ে ফাইল থেকে যায়
+                    try { resolver.delete(itemUri, null, null); } catch (Exception ignored) {}
+                    return "";
                 }
             } else {
                 File pubDir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "ProStream");
@@ -2723,7 +2764,7 @@ public class HomeActivity extends AppCompatActivity {
                 fos.flush();
                 fos.close();
                 fis.close();
-                MediaScannerConnection.scanFile(getApplicationContext(), new String[]{dest.getAbsolutePath()}, new String[]{"video/mp4"}, null);
+                MediaScannerConnection.scanFile(getApplicationContext(), new String[]{dest.getAbsolutePath()}, new String[]{mimeTypeForFileName(fileName)}, null);
                 return Uri.fromFile(dest).toString();
             }
         } catch (Throwable ignored) {}
@@ -2765,8 +2806,21 @@ public class HomeActivity extends AppCompatActivity {
     }
 
     private void startCustomStreamOrDirectDownload(final String mediaUrl, final String refererUrl, final String fileName, final boolean isHls) {
-        final File outFile = getSafeWritableDownloadFile(fileName);
-        final long taskId = System.currentTimeMillis();
+        // একই ভিডিওর ডাউনলোড ইতিমধ্যে চললে/থেমে থাকলে নতুন টাস্ক নয় —
+        // ডাবল-ট্যাপে দুটো টাস্ক একই ফাইলে লিখে দুটোই নষ্ট করতো
+        for (CustomDownloadTask existing : customTasksMap.values()) {
+            if (existing.url != null && existing.url.equals(mediaUrl)
+                    && (existing.status == DownloadManager.STATUS_RUNNING
+                    || existing.status == DownloadManager.STATUS_PENDING
+                    || existing.status == DownloadManager.STATUS_PAUSED)) {
+                Toast.makeText(this, "এই ডাউনলোডটি ইতিমধ্যে চলছে।", Toast.LENGTH_SHORT).show();
+                return;
+            }
+        }
+        final File outFile = getSafeWritableDownloadFile(fileName, true);
+        long newTaskId = System.currentTimeMillis();
+        while (customTasksMap.containsKey(newTaskId)) newTaskId++;
+        final long taskId = newTaskId;
 
         final CustomDownloadTask task = new CustomDownloadTask(taskId, fileName, mediaUrl, outFile, isHls);
         task.refererUrl = refererUrl;
@@ -2803,6 +2857,7 @@ public class HomeActivity extends AppCompatActivity {
         task.status = DownloadManager.STATUS_RUNNING;
         startBackgroundDownloadKeeperService(appContextRef);
         acquireTurboDownloadBoosterStatic(appContextRef);
+        startNotificationProgressTrackerStatic(appContextRef);
         customDlExecutor.execute(() -> {
             if (task.isHls) {
                 executeHlsM3u8Download(task, task.refererUrl);
@@ -2810,6 +2865,15 @@ public class HomeActivity extends AppCompatActivity {
                 executeDirectHttpTurboDownload(task, task.refererUrl);
             }
         });
+    }
+
+    // ডাইরেক্ট ডাউনলোড সম্পূর্ণ হয়েছে কি না — সাইজ জানা থাকলে সেটার সঙ্গে
+    // মেলাতে হবে; জানা না থাকলে কিছু পেলেই সম্পূর্ণ (আগের "> 1024" গেটে ছোট
+    // ফাইল ভুল করে ব্যর্থ হতো, আর অর্ধেক ফাইল ভুল করে সফল হতো)
+    private static boolean isDirectDownloadComplete(CustomDownloadTask task) {
+        long done = task.downloadedBytes.get();
+        if (task.totalBytes > 0) return done >= task.totalBytes;
+        return done > 0;
     }
 
     private void executeDirectHttpTurboDownload(final CustomDownloadTask task, final String refererUrl) {
@@ -2876,7 +2940,7 @@ public class HomeActivity extends AppCompatActivity {
                     task.status = DownloadManager.STATUS_PAUSED;
                     return;
                 }
-                if (parallelSuccess && !task.cancelled && task.downloadedBytes.get() > 1024) {
+                if (parallelSuccess && !task.cancelled && isDirectDownloadComplete(task)) {
                     finalizeSuccessfulTask(task);
                     return;
                 }
@@ -2903,11 +2967,11 @@ public class HomeActivity extends AppCompatActivity {
                 task.status = DownloadManager.STATUS_PAUSED;
                 return;
             }
-            if (!task.cancelled && task.downloadedBytes.get() > 1024) {
+            if (!task.cancelled && isDirectDownloadComplete(task)) {
                 finalizeSuccessfulTask(task);
             } else if (!task.cancelled) {
                 task.status = DownloadManager.STATUS_FAILED;
-                task.errorMessage = "No data received";
+                task.errorMessage = task.downloadedBytes.get() == 0 ? "No data received" : "ডাউনলোড অসম্পূর্ণ — আবার চেষ্টা করুন";
                 mainHandler.post(() -> Toast.makeText(appContextRef, "Download failed — tap to retry", Toast.LENGTH_SHORT).show());
             } else {
                 cancelOrRemoveDownloadStatic(appContextRef, task.id);
@@ -2954,10 +3018,11 @@ public class HomeActivity extends AppCompatActivity {
                         try {
                             partConn = openBrowserLikeConnectionWithRedirects(resolvedUrl, refererUrl, "bytes=" + currentOffset + "-" + endByte);
                             int code = partConn.getResponseCode();
-                            if (code != HttpURLConnection.HTTP_PARTIAL && code != HttpURLConnection.HTTP_OK) {
-                                return false;
-                            }
-                            if (code == HttpURLConnection.HTTP_OK && currentOffset > startByte) {
+                            if (code != HttpURLConnection.HTTP_PARTIAL) {
+                                // প্যারালাল পথে 206 ছাড়া চলবে না — সার্ভার Range
+                                // না মেনে 200 দিলে ফাইলের শুরুটা ভুল জায়গায়
+                                // লেখা হয়ে ফাইল নষ্ট হয়; সিঙ্গেল কানেকশনে
+                                // ফলব্যাক হবে (সেখানে 200 ঠিক আছে)
                                 return false;
                             }
                             partIn = new BufferedInputStream(partConn.getInputStream(), 128 * 1024);
@@ -2968,10 +3033,14 @@ public class HomeActivity extends AppCompatActivity {
                             int r;
                             while ((r = partIn.read(buf)) != -1) {
                                 if (task.cancelled || task.paused) return false;
-                                partRaf.write(buf, 0, r);
-                                currentOffset += r;
-                                task.partProgress[partIdx] += r;
-                                long totalNow = task.downloadedBytes.addAndGet(r);
+                                if (currentOffset > endByte) break;
+                                // সার্ভার রেঞ্জের বেশি পাঠালেও নিজের অংশের
+                                // বাইরে এক বাইটও লেখা যাবে না
+                                long toWrite = Math.min(r, endByte - currentOffset + 1);
+                                partRaf.write(buf, 0, (int) toWrite);
+                                currentOffset += toWrite;
+                                task.partProgress[partIdx] += toWrite;
+                                long totalNow = task.downloadedBytes.addAndGet(toWrite);
 
                                 long now = System.currentTimeMillis();
                                 synchronized (lastSpeedCheckTime) {
@@ -3124,8 +3193,14 @@ public class HomeActivity extends AppCompatActivity {
             }
 
             final List<String> segmentUrls = new ArrayList<>();
-            byte[] aesKeyBytes = null;
-            byte[] aesCustomIv = null;
+            // প্রত্যেক সেগমেন্টের নিজের কী/IV — কী রোটেশন থাকলে শেষ কী দিয়ে
+            // আগের সেগমেন্ট ডিক্রিপ্ট করা যাবে না (আগে সেটাই হতো)
+            final List<byte[]> segKeys = new ArrayList<>();
+            final List<byte[]> segIvs = new ArrayList<>();
+            byte[] currentKey = null;
+            byte[] currentIv = null;
+            boolean playlistHasAesKey = false;
+            boolean aesKeyMissing = false;
             int mediaSequenceBase = 0;
 
             for (String line : playlistText.split("\n")) {
@@ -3136,30 +3211,54 @@ public class HomeActivity extends AppCompatActivity {
                         mediaSequenceBase = Integer.parseInt(trimmed.substring("#EXT-X-MEDIA-SEQUENCE:".length()).trim());
                     } catch (Exception ignored) {}
                 } else if (trimmed.startsWith("#EXT-X-KEY:") && trimmed.contains("METHOD=AES-128")) {
+                    playlistHasAesKey = true;
                     Matcher keyUriMatcher = Pattern.compile("URI=\"([^\"]+)\"").matcher(trimmed);
                     if (keyUriMatcher.find() && keyUriMatcher.group(1) != null) {
                         String keyUrl = resolveRelativeUrl(activePlaylistUrl, keyUriMatcher.group(1));
                         byte[] fetchedKey = downloadSegmentBytesWithRetry(keyUrl, refererUrl, task);
                         if (fetchedKey != null && fetchedKey.length == 16) {
-                            aesKeyBytes = fetchedKey;
+                            currentKey = fetchedKey;
+                        } else {
+                            // কী আনতে না পারলে এনক্রিপ্ট করা ভিডিও লিখে
+                            // "সফল" দেখানো যাবে না — নিচে FAILED হবে
+                            currentKey = null;
+                            aesKeyMissing = true;
                         }
+                    } else {
+                        currentKey = null;
+                        aesKeyMissing = true;
                     }
                     Matcher ivMatcher = Pattern.compile("IV=0[xX]([0-9a-fA-F]{32})").matcher(trimmed);
                     if (ivMatcher.find() && ivMatcher.group(1) != null) {
                         String hexIv = ivMatcher.group(1);
-                        aesCustomIv = new byte[16];
+                        currentIv = new byte[16];
                         for (int b = 0; b < 16; b++) {
-                            aesCustomIv[b] = (byte) Integer.parseInt(hexIv.substring(b * 2, b * 2 + 2), 16);
+                            currentIv[b] = (byte) Integer.parseInt(hexIv.substring(b * 2, b * 2 + 2), 16);
                         }
                     }
+                } else if (trimmed.startsWith("#EXT-X-KEY:")) {
+                    // METHOD=NONE বা অন্য মেথড — এর পরের সেগমেন্ট এনক্রিপ্ট করা নয়
+                    currentKey = null;
+                    currentIv = null;
                 } else if (trimmed.startsWith("#EXT-X-MAP:")) {
                     Matcher mapMatcher = Pattern.compile("URI=\"([^\"]+)\"").matcher(trimmed);
                     if (mapMatcher.find() && mapMatcher.group(1) != null) {
                         segmentUrls.add(resolveRelativeUrl(activePlaylistUrl, mapMatcher.group(1)));
+                        segKeys.add(currentKey);
+                        segIvs.add(currentIv);
                     }
                 } else if (!trimmed.startsWith("#")) {
                     segmentUrls.add(resolveRelativeUrl(activePlaylistUrl, trimmed));
+                    segKeys.add(currentKey);
+                    segIvs.add(currentIv);
                 }
+            }
+
+            if (playlistHasAesKey && aesKeyMissing) {
+                task.status = DownloadManager.STATUS_FAILED;
+                task.errorMessage = "ভিডিওর এনক্রিপশন কী পাওয়া যায়নি — ডাউনলোড বন্ধ করা হয়েছে।";
+                mainHandler.post(() -> Toast.makeText(appContextRef, "ভিডিওর কী পাওয়া যায়নি — আবার চেষ্টা করুন", Toast.LENGTH_SHORT).show());
+                return;
             }
 
             if (segmentUrls.isEmpty()) {
@@ -3167,8 +3266,8 @@ public class HomeActivity extends AppCompatActivity {
                 return;
             }
 
-            final byte[] finalAesKey = aesKeyBytes;
-            final byte[] finalAesIv = aesCustomIv;
+            final List<byte[]> finalSegKeys = segKeys;
+            final List<byte[]> finalSegIvs = segIvs;
             final int finalSeqBase = mediaSequenceBase;
 
             task.totalSegments = segmentUrls.size();
@@ -3178,6 +3277,7 @@ public class HomeActivity extends AppCompatActivity {
             long bytesAtLastTick = 0;
 
             final int batchSize = 4;
+            boolean segmentFailed = false;
             for (int baseIdx = task.completedSegments; baseIdx < segmentUrls.size(); baseIdx += batchSize) {
                 if (task.cancelled || task.paused) break;
                 int endIdx = Math.min(segmentUrls.size(), baseIdx + batchSize);
@@ -3188,8 +3288,9 @@ public class HomeActivity extends AppCompatActivity {
                     final String segUrl = segmentUrls.get(j);
                     batchCallables.add(() -> {
                         byte[] rawSeg = downloadSegmentBytesWithRetry(segUrl, refererUrl, task);
-                        if (rawSeg != null && finalAesKey != null) {
-                            return decryptAes128Segment(rawSeg, finalAesKey, finalAesIv, finalSeqBase + segIndex);
+                        byte[] segKey = finalSegKeys.get(segIndex);
+                        if (rawSeg != null && segKey != null) {
+                            return decryptAes128Segment(rawSeg, segKey, finalSegIvs.get(segIndex), finalSeqBase + segIndex);
                         }
                         return rawSeg;
                     });
@@ -3199,7 +3300,10 @@ public class HomeActivity extends AppCompatActivity {
                 for (Future<byte[]> fut : batchFutures) {
                     if (task.cancelled) break;
                     byte[] segBytes = fut.get();
-                    if (segBytes != null && segBytes.length > 0) {
+                    // ব্যর্থ সেগমেন্ট (null/খালি/HTML এরর পেজ) গোনা যাবে না —
+                    // গুনলে ফাঁকসহ ভিডিও "সফল" দেখাতো; এখানে থামলে রিজিউম
+                    // ঠিক ব্যর্থ সেগমেন্ট থেকেই শুরু হবে
+                    if (segBytes != null && segBytes.length > 0 && segBytes[0] != '<') {
                         fos.write(segBytes);
                         long totalNow = task.downloadedBytes.addAndGet(segBytes.length);
 
@@ -3209,12 +3313,16 @@ public class HomeActivity extends AppCompatActivity {
                             lastTick = now;
                             bytesAtLastTick = totalNow;
                         }
-                    }
-                    task.completedSegments++;
-                    if (task.completedSegments > 0) {
-                        task.totalBytes = (task.downloadedBytes.get() * task.totalSegments) / task.completedSegments;
+                        task.completedSegments++;
+                        if (task.completedSegments > 0) {
+                            task.totalBytes = (task.downloadedBytes.get() * task.totalSegments) / task.completedSegments;
+                        }
+                    } else {
+                        segmentFailed = true;
+                        break;
                     }
                 }
+                if (segmentFailed) break;
             }
             fos.flush();
             fos.close();
@@ -3224,11 +3332,12 @@ public class HomeActivity extends AppCompatActivity {
                 task.status = DownloadManager.STATUS_PAUSED;
                 return;
             }
-            if (!task.cancelled && task.downloadedBytes.get() > 1024) {
+            if (!task.cancelled && !segmentFailed && task.completedSegments >= task.totalSegments) {
                 finalizeSuccessfulTask(task);
             } else if (!task.cancelled) {
                 task.status = DownloadManager.STATUS_FAILED;
-                task.errorMessage = "No data received";
+                task.errorMessage = segmentFailed ? "কিছু অংশ ডাউনলোড হয়নি — আবার চেষ্টা করুন"
+                        : (task.downloadedBytes.get() == 0 ? "No data received" : "ডাউনলোড অসম্পূর্ণ — আবার চেষ্টা করুন");
                 mainHandler.post(() -> Toast.makeText(appContextRef, "Stream download failed — tap to retry", Toast.LENGTH_SHORT).show());
             } else {
                 cancelOrRemoveDownloadStatic(appContextRef, task.id);
@@ -3272,12 +3381,21 @@ public class HomeActivity extends AppCompatActivity {
             InputStream segIn = null;
             try {
                 segConn = openBrowserLikeConnectionWithRedirects(segUrl, refererUrl, null);
+                int code = segConn.getResponseCode();
+                if (code != HttpURLConnection.HTTP_OK && code != HttpURLConnection.HTTP_PARTIAL) {
+                    // 403/404/500-এর বডি সেগমেন্ট নয় — আবার চেষ্টা, তারপর ব্যর্থ
+                    if (attempt == 2) return null;
+                    continue;
+                }
                 segIn = new BufferedInputStream(segConn.getInputStream(), 64 * 1024);
                 ByteArrayOutputStream baos = new ByteArrayOutputStream(128 * 1024);
                 byte[] buf = new byte[32 * 1024];
                 int r;
+                long totalRead = 0;
                 while ((r = segIn.read(buf)) != -1) {
                     if (task.cancelled) return null;
+                    totalRead += r;
+                    if (totalRead > 64L * 1024L * 1024L) return null; // একটা সেগমেন্ট কখনো 64 MB হয় না
                     baos.write(buf, 0, r);
                 }
                 return baos.toByteArray();
@@ -5584,7 +5702,7 @@ public class HomeActivity extends AppCompatActivity {
             HttpURLConnection conn = null;
             InputStream in = null;
             FileOutputStream fos = null;
-            final File apkFile = getSafeWritableDownloadFile("ProStream_Update.apk");
+            final File apkFile = getSafeWritableDownloadFile("ProStream_Update.apk", false);
             if (apkFile.exists()) {
                 apkFile.delete();
             }
