@@ -1,8 +1,11 @@
 package com.myname.prostream;
 
+import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
 import android.graphics.Color;
+import android.hardware.biometrics.BiometricManager;
+import android.os.Build;
 import android.os.Bundle;
 import android.text.Editable;
 import android.text.InputType;
@@ -14,6 +17,7 @@ import android.widget.RadioButton;
 import android.widget.RadioGroup;
 import android.widget.TextView;
 import android.widget.Toast;
+import androidx.activity.OnBackPressedCallback;
 import androidx.appcompat.app.AppCompatActivity;
 import com.google.android.material.appbar.MaterialToolbar;
 import com.google.android.material.button.MaterialButton;
@@ -23,6 +27,9 @@ public class AppLockActivity extends AppCompatActivity {
 
     private SharedPreferences prefs;
     private boolean resetMode;
+    // ঢোকার সময় PIN ছিল কি না — PIN না বসিয়ে ফিরে গেলে ভূতুড়ে লক স্টেট
+    // (LOCK_TYPE 1, কিন্তু PIN নেই) যেন না থাকে
+    private boolean hadPinAtEntry;
 
     private MaterialToolbar toolbarAppLock;
     private RadioGroup lockTypeGroup;
@@ -40,6 +47,7 @@ public class AppLockActivity extends AppCompatActivity {
         setContentView(R.layout.activity_app_lock);
 
         prefs = getSharedPreferences("ProStreamPrefs", MODE_PRIVATE);
+        hadPinAtEntry = AppUtil.hasPin(this);
 
         // findViewById দিয়ে সব ভিউ ধরা হয়েছে
         toolbarAppLock = findViewById(R.id.toolbarAppLock);
@@ -51,7 +59,13 @@ public class AppLockActivity extends AppCompatActivity {
         switchFingerprint = findViewById(R.id.switchFingerprint);
         saveLockButton = findViewById(R.id.saveLockButton);
 
-        toolbarAppLock.setNavigationOnClickListener(v -> finish());
+        toolbarAppLock.setNavigationOnClickListener(v -> finishWithPinCleanup());
+        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+            @Override
+            public void handleOnBackPressed() {
+                finishWithPinCleanup();
+            }
+        });
 
         // A2: Forgot PIN → বায়োমেট্রিক দিয়ে এসেছে, তাই বর্তমান PIN লাগবে না
         resetMode = getIntent().getBooleanExtra("RESET_PIN", false);
@@ -114,15 +128,15 @@ public class AppLockActivity extends AppCompatActivity {
                 return;
             }
             // A2: PIN আগে থেকে থাকলে বর্তমান PIN যাচাই করতে হবে
-            if (!resetMode && AppUtil.hasPin(prefs)) {
+            if (!resetMode && AppUtil.hasPin(this)) {
                 String current = editCurrentPassword.getText().toString().trim();
-                if (current.isEmpty() || !AppUtil.verifyPin(prefs, current)) {
+                if (current.isEmpty() || !AppUtil.verifyPin(this, current)) {
                     showPinError("বর্তমান PIN সঠিক নয়");
                     return;
                 }
             }
 
-            AppUtil.savePin(prefs, pass);
+            AppUtil.savePin(this, pass);
             prefs.edit()
                     .putInt("LOCK_TYPE", 1)
                     .putBoolean("USE_BIOMETRIC", switchFingerprint.isChecked())
@@ -135,28 +149,53 @@ public class AppLockActivity extends AppCompatActivity {
         applyThemeColor();
     }
 
-    // A1/A2: Confirm PIN + বর্তমান PIN ফিল্ড (কার্ডের নিচে, কোড থেকে যোগ করা হয়)
+    // PIN না বসিয়ে ফিরে গেলে ভূতুড়ে লক স্টেট থাকবে না — PIN আগে থেকে না
+    // থাকলে LOCK_TYPE 0 করে দেওয়া হয়
+    private void finishWithPinCleanup() {
+        if (!hadPinAtEntry && !AppUtil.hasPin(this)) {
+            prefs.edit().putInt("LOCK_TYPE", 0).putBoolean("USE_BIOMETRIC", false).apply();
+        }
+        finish();
+    }
+
+    // A1/A2: Confirm PIN + বর্তমান PIN ফিল্ড — কার্ডের ভেতরে সঠিক ক্রমে
+    // (বর্তমান → নতুন → নিশ্চিত করুন), New PIN ফিল্ডের মতো একই স্টাইলে
     private void addPinFields() {
         int numericPassword = InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD;
         editNewPassword.setInputType(numericPassword);
+
+        LinearLayout cardInner = (LinearLayout) editNewPassword.getParent();
 
         editCurrentPassword = new EditText(this);
         editCurrentPassword.setHint("বর্তমান PIN");
         editCurrentPassword.setInputType(numericPassword);
         editCurrentPassword.setTextColor(Color.WHITE);
+        editCurrentPassword.setHintTextColor(Color.parseColor("#666666"));
         editCurrentPassword.setTextSize(16);
-        editCurrentPassword.setPadding(dpToPx(16), dpToPx(12), dpToPx(16), dpToPx(12));
+        editCurrentPassword.setBackground(null);
+        editCurrentPassword.setPadding(dpToPx(20), dpToPx(20), dpToPx(20), dpToPx(20));
         // resetMode-এ (Forgot PIN → বায়োমেট্রিক) বর্তমান PIN লাগে না
-        editCurrentPassword.setVisibility(AppUtil.hasPin(prefs) && !resetMode ? View.VISIBLE : View.GONE);
-        passwordSection.addView(editCurrentPassword);
+        editCurrentPassword.setVisibility(AppUtil.hasPin(this) && !resetMode ? View.VISIBLE : View.GONE);
+        cardInner.addView(editCurrentPassword, cardInner.indexOfChild(editNewPassword));
 
         editConfirmPassword = new EditText(this);
         editConfirmPassword.setHint("PIN নিশ্চিত করুন");
         editConfirmPassword.setInputType(numericPassword);
         editConfirmPassword.setTextColor(Color.WHITE);
+        editConfirmPassword.setHintTextColor(Color.parseColor("#666666"));
         editConfirmPassword.setTextSize(16);
-        editConfirmPassword.setPadding(dpToPx(16), dpToPx(12), dpToPx(16), dpToPx(12));
-        passwordSection.addView(editConfirmPassword);
+        editConfirmPassword.setBackground(null);
+        editConfirmPassword.setPadding(dpToPx(20), dpToPx(20), dpToPx(20), dpToPx(20));
+        int confirmIdx = cardInner.indexOfChild(editNewPassword) + 2; // New PIN + তার ডিভাইডারের পরে
+        cardInner.addView(editConfirmPassword, confirmIdx);
+
+        View confirmDivider = new View(this);
+        LinearLayout.LayoutParams divParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dpToPx(1));
+        divParams.setMarginStart(dpToPx(20));
+        confirmDivider.setLayoutParams(divParams);
+        confirmDivider.setBackgroundColor(Color.parseColor("#222222"));
+        cardInner.addView(confirmDivider, confirmIdx + 1);
 
         tvPinError = new TextView(this);
         tvPinError.setTextColor(Color.parseColor("#FF6B6B"));
@@ -178,12 +217,29 @@ public class AppLockActivity extends AppCompatActivity {
         editConfirmPassword.addTextChangedListener(clearErrorWatcher);
     }
 
-    // A3: লক None হলে ফিঙ্গারপ্রিন্ট সুইচ নিষ্ক্রিয় (ধূসর) হয়ে যায়
+    // A3: লক None হলে ফিঙ্গারপ্রিন্ট সুইচ নিষ্ক্রিয় (ধূসর) হয়ে যায়;
+    // বায়োমেট্রিক এনরোল করা না থাকলেও সুইচ চালু করা যায় না
     private void updateFingerprintSwitch(int lockType) {
-        boolean enabled = lockType != 0;
+        boolean enabled = lockType != 0 && isBiometricEnrolled();
         switchFingerprint.setEnabled(enabled);
         switchFingerprint.setAlpha(enabled ? 1f : 0.4f);
         if (!enabled) switchFingerprint.setChecked(false);
+    }
+
+    @SuppressWarnings("deprecation")
+    private boolean isBiometricEnrolled() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return false;
+        try {
+            BiometricManager bm = (BiometricManager) getSystemService(Context.BIOMETRIC_SERVICE);
+            if (bm == null) return false;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                return bm.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+                        == BiometricManager.BIOMETRIC_SUCCESS;
+            }
+            return bm.canAuthenticate() == BiometricManager.BIOMETRIC_SUCCESS;
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     private void showPinError(String message) {
