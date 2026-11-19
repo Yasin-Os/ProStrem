@@ -309,7 +309,7 @@ public class HomeActivity extends AppCompatActivity {
     private final Set<String> fetchingOgUrls = Collections.synchronizedSet(new HashSet<>());
 
     private SiteItem currentSite;
-    private final int appColor = Color.parseColor("#00A884");
+    private final int appColor = Color.parseColor("#00F5A0");
     private boolean darkModeEnabled = false;
     private boolean batterySaverEnabled = true;
     private boolean launchingInternalActivity = false;
